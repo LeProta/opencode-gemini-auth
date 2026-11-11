@@ -68,4 +68,8 @@ describe("user-agent", () => {
       `(${process.platform}; ${process.arch}; vscode)`,
     );
   });
+
+  it("strips optional models/ prefix from the model segment", () => {
+    expect(buildGeminiCliUserAgent("models/gemini-2.5-pro")).toContain("/gemini-2.5-pro ");
+  });
 });

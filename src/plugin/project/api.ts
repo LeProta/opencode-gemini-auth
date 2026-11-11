@@ -56,7 +56,7 @@ export async function loadManagedProject(
       return null;
     }
 
-    if (responseBody) {
+    if (responseBody !== undefined) {
       return parseJsonSafe(responseBody) as LoadCodeAssistPayload;
     }
     return (await response.json()) as LoadCodeAssistPayload;
@@ -76,6 +76,7 @@ export async function onboardManagedProject(
   userAgentModel?: string,
   attempts = 10,
   delayMs = 5000,
+  signal?: AbortSignal,
 ): Promise<string | undefined> {
   const isFreeTier = tierId === FREE_TIER_ID;
   const metadata = buildMetadata(projectId, !isFreeTier);
@@ -98,6 +99,7 @@ export async function onboardManagedProject(
       buildCodeAssistHeaders(accessToken, userAgentModel),
       requestBody,
       projectId,
+      signal,
     );
     if (!response.ok) {
       return undefined;
@@ -106,7 +108,13 @@ export async function onboardManagedProject(
     let payload = (await response.json()) as OnboardUserPayload;
     if (!payload.done && payload.name) {
       for (let attempt = 0; attempt < attempts; attempt += 1) {
-        await wait(delayMs);
+        if (signal?.aborted) {
+          return undefined;
+        }
+        await wait(delayMs, signal);
+        if (signal?.aborted) {
+          return undefined;
+        }
         const operationUrl = `${baseUrl}/${payload.name}`;
         const opResponse = await fetchWithDebug(
           operationUrl,
@@ -114,6 +122,7 @@ export async function onboardManagedProject(
           buildCodeAssistHeaders(accessToken, userAgentModel),
           undefined,
           projectId,
+          signal,
         );
         if (!opResponse.ok) {
           return undefined;
@@ -182,6 +191,7 @@ async function fetchWithDebug(
   headers: Record<string, string>,
   body: Record<string, unknown> | undefined,
   projectId?: string,
+  signal?: AbortSignal,
 ): Promise<Response> {
   const debugContext = startGeminiDebugRequest({
     originalUrl: url,
@@ -196,6 +206,7 @@ async function fetchWithDebug(
     method,
     headers,
     body: body ? JSON.stringify(body) : undefined,
+    signal,
   });
   if (debugContext) {
     const responseBody = await readResponseTextIfNeeded(response, true);

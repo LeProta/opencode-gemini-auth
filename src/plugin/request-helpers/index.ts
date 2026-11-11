@@ -7,6 +7,11 @@ export {
   type GeminiUsageMetadata,
   type ThinkingConfig,
 } from "./types";
-export { normalizeThinkingConfig } from "./thinking";
+export { normalizeThinkingConfig, type NormalizeThinkingOptions } from "./thinking";
 export { parseGeminiApiBody, extractUsageMetadata } from "./parsing";
-export { rewriteGeminiPreviewAccessError, enhanceGeminiErrorResponse } from "./errors";
+export {
+  rewriteGeminiPreviewAccessError,
+  enhanceGeminiErrorResponse,
+  parseRetryDelayValue,
+  parseRetryDelayFromMessage,
+} from "./errors";

@@ -63,24 +63,35 @@ OpenCode V2:
 
 ### OpenCode V2 Compatibility
 
-OpenCode V2 loads the package's native `./server` entrypoint. It registers the
-Gemini CLI OAuth method through `integration.transform` and rewrites Google
-provider requests and responses through provider-scoped V2 session HTTP hooks.
-The entrypoint targets OpenCode 2.0.14 and uses `Plugin.define` from
-`@opencode/plugin@2.0.14`. Project settings are read through `ctx.provider.get`.
-Provider lookup failures are reported instead of silently selecting another
-Google Cloud project.
+OpenCode V2 loads the package's native `./server` entrypoint (`id: "Gemini OAuth Plugin"`,
+targeting `@opencode/plugin@2.0.14` with runtime guards for `connection.status` on `2.0.31+`):
 
-The V1 entrypoint remains unchanged. The V2 entrypoint currently covers login
-and model requests; the `/gquota` command, quota tool, retry transport, and TUI
-capacity notifications remain V1-only.
+- **OAuth & Multi-Account Isolation**: Registers `gemini-cli` OAuth via `integration.transform`
+  with an optional `projectId` form field in `/connect`, stores credential metadata (`email`,
+  `projectId`, `managedProjectId`), formats connection labels, isolates project caches per
+  account/connection, and shares cross-process locked token refresh with exponential/terminal
+  backoff and `ctx.storage` persistence.
+- **Provider Costs & Reloading**: Zeroes Google model billing costs (`model.cost = []`) via
+  `provider.transform` only when the active `google` connection uses `gemini-cli` OAuth, and
+  automatically reloads providers on `credential.updated` / `credential.switched` events.
+- **Requests, 401 Replay & Retries**: Rewrites Cloud Code Assist requests (`settings.thinkingConfig`
+  supported under `providers.google.settings` and model `settings`), replays once on HTTP `401`
+  after forced token refresh, and honors Gemini quota/capacity fail-fast rules and `RetryInfo`
+  delays via `session.hook("retry")` (configurable via `OPENCODE_GEMINI_MAX_RETRY_MS`, default
+  `60000`).
+- **Quota Inspection**: Registers both the `gemini_quota` tool and the `/gquota` command
+  (`ctx.session.synthetic`) in V2 as well as V1.
+
+TUI toast notifications (`MODEL_CAPACITY_EXHAUSTED` warning toasts and `OPENCODE_GEMINI_TEST_TOAST`)
+remain V1-only.
 
 ## Usage
 
 1. **Login**: Run `opencode auth login` on V1 or open `/connect` in OpenCode V2.
 
 2. **Select Provider**: Choose **Google** from the list.
-3. **Authenticate**: Select **OAuth with Google (Gemini CLI)**.
+3. **Authenticate**: Select **OAuth with Google (Gemini CLI)** (and optionally enter a `projectId`
+   in OpenCode V2 when using Standard, Enterprise, or Workspace accounts).
    - A browser window will open for you to approve the access.
    - The plugin spins up a temporary local server to capture the callback.
    - If the local server fails (e.g., port in use or headless environment),
@@ -88,7 +99,7 @@ capacity notifications remain V1-only.
 
 Once authenticated, Opencode will use your Google account for Gemini requests.
 
-On V1, check your current Gemini Code Assist quota buckets with:
+Check your current Gemini Code Assist quota buckets in both V1 and V2 with:
 
 ```bash
 /gquota
@@ -247,10 +258,11 @@ the Gemini product page for the current model identifiers.
 ### Thinking Models
 
 The plugin supports configuring Gemini "thinking" features per-model via
-`thinkingConfig`. The available fields depend on the model family:
+`thinkingConfig` (under `options.thinkingConfig` in V1 or `settings.thinkingConfig` in V2).
+The available fields depend on the model family:
 
-- For Gemini 3 models: use `thinkingLevel` with values `"low"` or `"high"`.
-- For Gemini 2.5 models: use `thinkingBudget` (token count).
+- For Gemini 3 models: use `thinkingLevel` with values `"low"`, `"medium"`, `"high"`, etc.
+- For Gemini 2.5 models: use `thinkingBudget` (token count, or `-1` for dynamic thinking budget).
 - `includeThoughts` (boolean) controls whether the model emits internal thoughts.
 
 A combined example showing both model types:
@@ -313,19 +325,23 @@ Common causes of `429 RESOURCE_EXHAUSTED` or `QUOTA_EXHAUSTED`:
 Notes:
 
 - **Gemini CLI auto-fallbacks**: the official CLI may fall back to Flash when Pro quotas are exhausted, so it can appear to “work” even if the Pro bucket is depleted.
-- **Org-backed Code Assist subscriptions require a project**: if you're using Gemini Code Assist `Standard` or `Enterprise`, set `provider.google.options.projectId` (or `OPENCODE_GEMINI_PROJECT_ID`) and re-authenticate.
+- **Org-backed Code Assist subscriptions require a project**: if you're using Gemini Code Assist `Standard` or `Enterprise`, set `provider.google.options.projectId` (V1), `providers.google.settings.projectId` (V2), or `OPENCODE_GEMINI_PROJECT_ID` and re-authenticate.
+- **Retry delay cap**: short per-minute rate-limit retries honor `OPENCODE_GEMINI_MAX_RETRY_MS` (default `60000` ms) in both V1 and V2; delays above the cap fail fast instead of stalling.
 
 ### Debugging
 
-To view detailed logs of Gemini requests and responses, set the
+To view detailed logs of Gemini requests, responses, and OAuth token refreshes, set the
 `OPENCODE_GEMINI_DEBUG` environment variable:
 
 ```bash
 OPENCODE_GEMINI_DEBUG=1 opencode
 ```
 
-This will generate `gemini-debug-<timestamp>.log` files in your working
-directory containing sanitized request/response details.
+Debug logs (`gemini-debug-<timestamp>.log` and `gemini-auth-YYYY-MM-DD.log`) are created lazily
+inside `<opencode-data-dir>/gemini-auth/logs/` (`%LOCALAPPDATA%\opencode\gemini-auth\logs` on
+Windows, `~/Library/Application Support/opencode/gemini-auth/logs` on macOS,
+`$XDG_DATA_HOME/opencode/gemini-auth/logs` or `~/.local/share/opencode/gemini-auth/logs` on Linux;
+override via `OPENCODE_DATA_DIR`), with tokens, API keys, and sensitive headers redacted.
 
 ## Parity Notes
 

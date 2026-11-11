@@ -20,10 +20,14 @@ export function toRequestUrlString(value: RequestInfo): string {
 }
 
 /**
- * Detects Gemini/Generative Language API requests by URL.
+ * Detects Gemini/Generative Language API requests by URL hostname.
  */
-export function isGenerativeLanguageRequest(input: RequestInfo): input is string {
-  return toRequestUrlString(input).includes("generativelanguage.googleapis.com");
+export function isGenerativeLanguageRequest(input: RequestInfo): boolean {
+  try {
+    return new URL(toRequestUrlString(input)).hostname === "generativelanguage.googleapis.com";
+  } catch {
+    return false;
+  }
 }
 
 export function parseGenerativeLanguageRequest(input: RequestInfo):
@@ -43,7 +47,7 @@ export function parseGenerativeLanguageRequest(input: RequestInfo):
 }
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
-  return !!value && typeof value === "object";
+  return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
 export function readString(value: unknown): string | undefined {

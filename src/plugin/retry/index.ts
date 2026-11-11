@@ -1,24 +1,29 @@
 import {
   canRetryRequest,
+  computeGeminiRetryDecision,
   DEFAULT_MAX_ATTEMPTS,
+  DEFAULT_MAX_RETRY_DELAY_MS,
   getExponentialDelayWithJitter,
+  getMaxRetryDelayMs,
   isRetryableNetworkError,
   isRetryableStatus,
+  MODEL_CAPACITY_COOLDOWN_MS,
   resolveRetryDelayMs,
-  wait,
+  sleepUnlessAborted,
+  type GeminiRetryDecision,
 } from "./helpers";
-import { classifyQuotaResponse, retryInternals } from "./quota";
+import { classifyQuotaResponse, retryInternals, type QuotaContext } from "./quota";
 import { isGeminiDebugEnabled, logGeminiDebugMessage } from "../debug";
 import { geminiFetch } from "../../fetch";
 
 const retryCooldownByKey = new Map<string, number>();
 const RETRY_IN_FLIGHT_LOG_INTERVAL_MS = 5000;
-const MODEL_CAPACITY_COOLDOWN_MS = 8000;
 
 /**
  * Sends requests with retry/backoff semantics aligned to Gemini CLI:
  * - Retries on 429/5xx and transient network failures
  * - Honors Retry-After and google.rpc.RetryInfo
+ * - Respects AbortSignal and OPENCODE_GEMINI_MAX_RETRY_MS
  * - Never rewrites requested model
  */
 export async function fetchWithRetry(
@@ -29,9 +34,11 @@ export async function fetchWithRetry(
     return geminiFetch(input, init);
   }
 
-  const retryInit = cloneRetryableInit(init);
+  const retryInit = cloneRetryableInit(init, input);
   const throttleKey = buildRetryThrottleKey(input, retryInit);
   await waitForRetryCooldown(throttleKey, retryInit.signal);
+  throwIfAborted(retryInit.signal);
+
   let attempt = 1;
   const url = readRequestUrl(input);
 
@@ -39,9 +46,7 @@ export async function fetchWithRetry(
     let response: Response;
     const stopInFlightLog = startInFlightLog(attempt, url);
     try {
-      debugRetry(
-        `attempt ${attempt}/${DEFAULT_MAX_ATTEMPTS} -> ${url}`,
-      );
+      debugRetry(`attempt ${attempt}/${DEFAULT_MAX_ATTEMPTS} -> ${url}`);
       response = await geminiFetch(input, retryInit);
     } catch (error) {
       stopInFlightLog();
@@ -57,10 +62,20 @@ export async function fetchWithRetry(
       }
 
       const delayMs = getExponentialDelayWithJitter(attempt);
+      if (delayMs > getMaxRetryDelayMs()) {
+        debugRetry(
+          `attempt ${attempt} network delay ${delayMs}ms exceeds max retry delay, failing fast`,
+        );
+        throw error;
+      }
+
       debugRetry(
         `attempt ${attempt} network retry scheduled in ${delayMs}ms (${formatErrorSummary(error)})`,
       );
-      await wait(delayMs);
+      await sleepUnlessAborted(delayMs, retryInit.signal);
+      if (retryInit.signal?.aborted) {
+        throw error;
+      }
       attempt += 1;
       continue;
     }
@@ -72,34 +87,45 @@ export async function fetchWithRetry(
     }
 
     const quotaContext = response.status === 429 ? await classifyQuotaResponse(response) : null;
-    if (response.status === 429 && quotaContext?.terminal) {
-      if (quotaContext.reason === "MODEL_CAPACITY_EXHAUSTED") {
-        const cooldownMs = quotaContext.retryDelayMs ?? MODEL_CAPACITY_COOLDOWN_MS;
-        setRetryCooldown(throttleKey, cooldownMs);
-        debugRetry(`terminal model capacity; cooldown ${cooldownMs}ms before next request`);
+    const decision = await computeGeminiRetryDecision(response, attempt, quotaContext, {
+      signal: retryInit.signal,
+    });
+
+    if (decision.cooldownMs !== undefined && decision.cooldownMs > 0) {
+      const boundedCooldownMs = Math.min(
+        decision.cooldownMs,
+        Math.max(getMaxRetryDelayMs(), MODEL_CAPACITY_COOLDOWN_MS),
+      );
+      recordRetryCooldown(throttleKey, boundedCooldownMs);
+    }
+
+    if (!decision.shouldRetry) {
+      if (decision.reason === "terminal_quota") {
+        debugRetry(
+          `attempt ${attempt} terminal 429 (${quotaContext?.reason ?? "unknown"}), returning without retry`,
+        );
+      } else if (decision.reason === "retry_delay_exceeds_max") {
+        debugRetry(
+          `attempt ${attempt} retry delay ${decision.delayMs}ms exceeds max, returning without retry`,
+        );
+      } else {
+        debugRetry(
+          `attempt ${attempt} reached retry boundary (${decision.reason}, status=${response.status})`,
+        );
       }
-      debugRetry(
-        `attempt ${attempt} terminal 429 (${quotaContext.reason ?? "unknown"}), returning without retry`,
-      );
       return response;
     }
 
-    if (attempt >= DEFAULT_MAX_ATTEMPTS || retryInit.signal?.aborted) {
-      debugRetry(
-        `attempt ${attempt} reached retry boundary (status=${response.status})`,
-      );
-      return response;
-    }
-
-    const delayMs = await resolveRetryDelayMs(response, attempt, quotaContext?.retryDelayMs);
     debugRetry(
-      `attempt ${attempt} retrying status=${response.status} reason=${quotaContext?.reason ?? "n/a"} delay=${delayMs}ms`,
+      `attempt ${attempt} retrying status=${response.status} reason=${quotaContext?.reason ?? "n/a"} delay=${decision.delayMs}ms`,
     );
-    if (delayMs > 0 && response.status === 429) {
-      setRetryCooldown(throttleKey, delayMs);
-    }
-    if (delayMs > 0) {
-      await wait(delayMs);
+    await cancelResponseBody(response);
+
+    if (decision.delayMs > 0) {
+      await sleepUnlessAborted(decision.delayMs, retryInit.signal);
+      if (retryInit.signal?.aborted) {
+        return response;
+      }
     }
     attempt += 1;
   }
@@ -107,25 +133,76 @@ export async function fetchWithRetry(
   return geminiFetch(input, retryInit);
 }
 
-function cloneRetryableInit(init: RequestInit | undefined): RequestInit {
+function throwIfAborted(signal?: AbortSignal | null): void {
+  if (!signal?.aborted) {
+    return;
+  }
+  if (typeof signal.throwIfAborted === "function") {
+    signal.throwIfAborted();
+  }
+  throw signal.reason ?? new DOMException("The operation was aborted", "AbortError");
+}
+
+async function cancelResponseBody(response: Response): Promise<void> {
+  if (!response.body) {
+    return;
+  }
+  try {
+    await response.body.cancel();
+  } catch {}
+}
+
+function cloneRetryableInit(init: RequestInit | undefined, input?: RequestInfo): RequestInit {
   if (!init) {
-    return {};
+    return input instanceof Request ? { headers: new Headers(input.headers) } : {};
   }
   return {
     ...init,
-    headers: new Headers(init.headers ?? {}),
+    headers: new Headers(
+      init.headers !== undefined
+        ? init.headers
+        : input instanceof Request
+          ? input.headers
+          : undefined,
+    ),
   };
 }
 
-function buildRetryThrottleKey(input: RequestInfo, init: RequestInit): string {
+export function buildRetryThrottleKey(input: RequestInfo, init?: RequestInit): string {
   const url = readRequestUrl(input);
-  const body = typeof init.body === "string" ? safeParseBody(init.body) : null;
+  const body = typeof init?.body === "string" ? safeParseBody(init.body) : null;
   const project = readString(body?.project);
   const model = readString(body?.model);
   return `${url}|${project ?? ""}|${model ?? ""}`;
 }
 
-async function waitForRetryCooldown(key: string, signal?: AbortSignal | null): Promise<void> {
+function pruneExpiredCooldowns(now = Date.now()): void {
+  for (const [key, until] of retryCooldownByKey.entries()) {
+    if (until <= now) {
+      retryCooldownByKey.delete(key);
+    }
+  }
+}
+
+export function getRetryCooldownRemainingMs(key: string): number {
+  const until = retryCooldownByKey.get(key);
+  if (!until) {
+    return 0;
+  }
+  const remaining = until - Date.now();
+  if (remaining <= 0) {
+    if (retryCooldownByKey.get(key) === until) {
+      retryCooldownByKey.delete(key);
+    }
+    return 0;
+  }
+  return remaining;
+}
+
+export async function waitForRetryCooldown(
+  key: string,
+  signal?: AbortSignal | null,
+): Promise<void> {
   const until = retryCooldownByKey.get(key);
   if (!until) {
     return;
@@ -133,7 +210,9 @@ async function waitForRetryCooldown(key: string, signal?: AbortSignal | null): P
 
   const remaining = until - Date.now();
   if (remaining <= 0) {
-    retryCooldownByKey.delete(key);
+    if (retryCooldownByKey.get(key) === until) {
+      retryCooldownByKey.delete(key);
+    }
     return;
   }
   if (signal?.aborted) {
@@ -142,15 +221,22 @@ async function waitForRetryCooldown(key: string, signal?: AbortSignal | null): P
   }
 
   debugRetry(`cooldown wait ${remaining}ms (key=${shortKey(key)})`);
-  await wait(remaining);
-  retryCooldownByKey.delete(key);
+  await sleepUnlessAborted(remaining, signal);
+  if (!signal?.aborted && retryCooldownByKey.get(key) === until) {
+    retryCooldownByKey.delete(key);
+  }
 }
 
-function setRetryCooldown(key: string, delayMs: number): void {
-  const next = Date.now() + delayMs;
+export function recordRetryCooldown(key: string, delayMs: number): void {
+  if (!Number.isFinite(delayMs) || delayMs <= 0) {
+    return;
+  }
+  const now = Date.now();
+  pruneExpiredCooldowns(now);
+  const next = now + Math.round(delayMs);
   const current = retryCooldownByKey.get(key) ?? 0;
   retryCooldownByKey.set(key, Math.max(current, next));
-  debugRetry(`cooldown set ${delayMs}ms (key=${shortKey(key)})`);
+  debugRetry(`cooldown set ${Math.round(delayMs)}ms (key=${shortKey(key)})`);
 }
 
 function readRequestUrl(input: RequestInfo): string {
@@ -175,7 +261,7 @@ function safeParseBody(body: string): Record<string, unknown> | null {
 
   try {
     const parsed = JSON.parse(body);
-    if (parsed && typeof parsed === "object") {
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
       return parsed as Record<string, unknown>;
     }
   } catch {}
@@ -220,4 +306,18 @@ function startInFlightLog(attempt: number, url: string): () => void {
   };
 }
 
-export { retryInternals };
+export {
+  classifyQuotaResponse,
+  computeGeminiRetryDecision,
+  DEFAULT_MAX_ATTEMPTS,
+  DEFAULT_MAX_RETRY_DELAY_MS,
+  getMaxRetryDelayMs,
+  isRetryableNetworkError,
+  isRetryableStatus,
+  MODEL_CAPACITY_COOLDOWN_MS,
+  resolveRetryDelayMs,
+  retryInternals,
+  sleepUnlessAborted,
+  type GeminiRetryDecision,
+  type QuotaContext,
+};

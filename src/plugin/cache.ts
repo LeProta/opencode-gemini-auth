@@ -40,6 +40,17 @@ export function resolveCachedAuth(auth: OAuthAuthDetails): OAuthAuthDetails {
 }
 
 /**
+ * Returns the cached auth snapshot for `refresh` without mutating the cache.
+ */
+export function getCachedAuth(refresh: string): OAuthAuthDetails | undefined {
+  const key = normalizeRefreshKey(refresh);
+  if (!key) {
+    return undefined;
+  }
+  return authCache.get(key);
+}
+
+/**
  * Stores the latest auth snapshot keyed by refresh token.
  */
 export function storeCachedAuth(auth: OAuthAuthDetails): void {

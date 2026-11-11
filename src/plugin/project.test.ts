@@ -1,8 +1,15 @@
-import { beforeEach, describe, expect, it, mock } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 
-import { formatRefreshParts } from "./auth";
-import { resolveProjectContextFromAccessToken } from "./project";
-import type { OAuthAuthDetails } from "./types";
+import { formatRefreshParts, parseRefreshParts } from "./auth";
+import {
+  clearPersistedProjectFromAuth,
+  createProjectContextCache,
+  ensureProjectContext,
+  invalidateProjectContextByAccount,
+  invalidateProjectContextCache,
+  resolveProjectContextFromAccessToken,
+} from "./project";
+import type { OAuthAuthDetails, PluginClient } from "./types";
 
 const baseAuth: OAuthAuthDetails = {
   type: "oauth",
@@ -234,5 +241,174 @@ describe("resolveProjectContextFromAccessToken", () => {
 
     expect(result.effectiveProjectId).toBe("configured-project");
     expect(loadBody?.cloudaicompanionProject).toBe("configured-project");
+  });
+
+  it("clears stale managedProjectId when configured project overrides loadCodeAssist response", async () => {
+    const originalFetch = globalThis.fetch;
+    try {
+      const authWithManagedProject: OAuthAuthDetails = {
+        ...baseAuth,
+        refresh: formatRefreshParts({
+          refreshToken: "refresh-token",
+          managedProjectId: "stale-managed-project",
+        }),
+      };
+      const persisted: OAuthAuthDetails[] = [];
+      (globalThis as { fetch: typeof fetch }).fetch = mock(async (input: RequestInfo) => {
+        const url = toUrlString(input);
+        if (url.includes(":loadCodeAssist")) {
+          return new Response(
+            JSON.stringify({
+              currentTier: { id: "standard-tier" },
+              cloudaicompanionProject: "projects/server-managed-project",
+            }),
+            { status: 200 },
+          );
+        }
+        throw new Error(`Unexpected fetch to ${url}`);
+      }) as unknown as typeof fetch;
+
+      const result = await resolveProjectContextFromAccessToken(
+        authWithManagedProject,
+        authWithManagedProject.access ?? "",
+        "configured-project",
+        async (updated) => {
+          persisted.push(updated);
+        },
+      );
+
+      expect(result.effectiveProjectId).toBe("configured-project");
+      expect(result.auth.refresh).toBe(
+        formatRefreshParts({
+          refreshToken: "refresh-token",
+          projectId: "configured-project",
+        }),
+      );
+      expect(parseRefreshParts(result.auth.refresh).managedProjectId).toBeUndefined();
+      expect(persisted).toHaveLength(1);
+      expect(persisted[0]?.refresh).toBe(result.auth.refresh);
+    } finally {
+      (globalThis as { fetch: typeof fetch }).fetch = originalFetch;
+    }
+  });
+});
+
+describe("ensureProjectContext caching and invalidation", () => {
+  const originalFetch = globalThis.fetch;
+
+  beforeEach(() => {
+    mock.restore();
+  });
+
+  afterEach(() => {
+    (globalThis as { fetch: typeof fetch }).fetch = originalFetch;
+  });
+
+  it("caches resolved context per configured project and account scope", async () => {
+    let loadCalls = 0;
+    const fetchMock = mock(async (input: RequestInfo) => {
+      const url = toUrlString(input);
+      if (url.includes(":loadCodeAssist")) {
+        loadCalls += 1;
+        return new Response(
+          JSON.stringify({
+            currentTier: { id: "standard-tier" },
+          }),
+          { status: 200 },
+        );
+      }
+      throw new Error(`Unexpected fetch to ${url}`);
+    });
+    (globalThis as { fetch: typeof fetch }).fetch = fetchMock as unknown as typeof fetch;
+
+    const client = { auth: { set: async () => {} } } satisfies PluginClient;
+    const cache = createProjectContextCache();
+    const persisted: OAuthAuthDetails[] = [];
+
+    const first = await ensureProjectContext(baseAuth, client, "proj-a", undefined, {
+      accountKey: "conn-1",
+      cache,
+      persistAuth: async (updated) => {
+        persisted.push(updated);
+      },
+    });
+    const secondPreHydration = await ensureProjectContext(baseAuth, client, "proj-a", undefined, {
+      accountKey: "conn-1",
+      cache,
+      persistAuth: async () => {},
+    });
+    const thirdPostHydration = await ensureProjectContext(
+      first.auth,
+      client,
+      "proj-a",
+      undefined,
+      {
+        accountKey: "conn-1",
+        cache,
+        persistAuth: async () => {},
+      },
+    );
+
+    expect(first.effectiveProjectId).toBe("proj-a");
+    expect(secondPreHydration.effectiveProjectId).toBe("proj-a");
+    expect(thirdPostHydration.effectiveProjectId).toBe("proj-a");
+    expect(loadCalls).toBe(1);
+    expect(persisted).toHaveLength(1);
+
+    const otherProject = await ensureProjectContext(baseAuth, client, "proj-b", undefined, {
+      accountKey: "conn-1",
+      cache,
+      persistAuth: async () => {},
+    });
+    expect(otherProject.effectiveProjectId).toBe("proj-b");
+    expect(loadCalls).toBe(2);
+
+    const otherAccount = await ensureProjectContext(baseAuth, client, "proj-a", undefined, {
+      accountKey: "conn-2",
+      cache,
+      persistAuth: async () => {},
+    });
+    expect(otherAccount.effectiveProjectId).toBe("proj-a");
+    expect(loadCalls).toBe(3);
+
+    invalidateProjectContextByAccount("conn-1", cache);
+    await ensureProjectContext(baseAuth, client, "proj-a", undefined, {
+      accountKey: "conn-2",
+      cache,
+      persistAuth: async () => {},
+    });
+    expect(loadCalls).toBe(3);
+
+    await ensureProjectContext(baseAuth, client, "proj-a", undefined, {
+      accountKey: "conn-1",
+      cache,
+      persistAuth: async () => {},
+    });
+    expect(loadCalls).toBe(4);
+
+    invalidateProjectContextCache(first.auth.refresh, cache);
+    await ensureProjectContext(baseAuth, client, "proj-a", undefined, {
+      accountKey: "conn-2",
+      cache,
+      persistAuth: async () => {},
+    });
+    expect(loadCalls).toBe(5);
+  });
+
+  it("clearPersistedProjectFromAuth strips project segments only when present", () => {
+    const clean = clearPersistedProjectFromAuth(baseAuth);
+    expect(clean).toBe(baseAuth);
+
+    const dirty: OAuthAuthDetails = {
+      ...baseAuth,
+      refresh: formatRefreshParts({
+        refreshToken: "refresh-token",
+        projectId: "proj-1",
+        managedProjectId: "managed-1",
+      }),
+    };
+    const stripped = clearPersistedProjectFromAuth(dirty);
+    expect(stripped).not.toBe(dirty);
+    expect(stripped.refresh).toBe("refresh-token");
   });
 });

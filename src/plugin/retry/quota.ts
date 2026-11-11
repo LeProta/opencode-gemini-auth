@@ -1,3 +1,9 @@
+import {
+  CLOUDCODE_DOMAINS as CLOUDCODE_DOMAIN_LIST,
+  parseRetryDelayFromMessage as parseSharedRetryDelayFromMessage,
+  parseRetryDelayValue as parseSharedRetryDelayValue,
+} from "../request-helpers";
+
 interface GoogleRpcErrorInfo {
   "@type"?: string;
   reason?: string;
@@ -26,12 +32,7 @@ export interface QuotaContext {
   reason?: string;
 }
 
-const CLOUDCODE_DOMAINS = new Set([
-  "cloudcode-pa.googleapis.com",
-  "staging-cloudcode-pa.googleapis.com",
-  "autopush-cloudcode-pa.googleapis.com",
-  "cloudaicompanion.googleapis.com",
-]);
+const CLOUDCODE_DOMAINS = new Set(CLOUDCODE_DOMAIN_LIST);
 
 /**
  * Parses Code Assist 429 payload details to determine terminal vs retryable quota states.
@@ -53,30 +54,45 @@ export async function classifyQuotaResponse(response: Response): Promise<QuotaCo
       detail["@type"] === "type.googleapis.com/google.rpc.RetryInfo",
   );
   const retryDelayMs =
-    (retryInfo?.retryDelay ? parseRetryDelayValue(retryInfo.retryDelay) : null) ??
-    parseRetryDelayFromMessage(payload.message ?? "") ??
+    (retryInfo?.retryDelay ? parseSharedRetryDelayValue(retryInfo.retryDelay) : null) ??
+    parseSharedRetryDelayFromMessage(payload.message ?? "") ??
     undefined;
 
-  const errorInfo = details.find(
+  const errorInfos = details.filter(
     (detail): detail is GoogleRpcErrorInfo =>
       isObject(detail) &&
       detail["@type"] === "type.googleapis.com/google.rpc.ErrorInfo",
   );
-
-  if (errorInfo?.domain && !CLOUDCODE_DOMAINS.has(errorInfo.domain)) {
+  const cloudCodeErrorInfos = errorInfos.filter(
+    (info) => !info.domain || CLOUDCODE_DOMAINS.has(info.domain),
+  );
+  if (errorInfos.length > 0 && cloudCodeErrorInfos.length === 0) {
     return null;
   }
-  if (errorInfo?.reason === "QUOTA_EXHAUSTED") {
-    return { terminal: true, retryDelayMs, reason: errorInfo.reason };
+
+  const prioritizedErrorInfo =
+    cloudCodeErrorInfos.find(
+      (info) =>
+        info.reason === "QUOTA_EXHAUSTED" ||
+        info.reason === "RATE_LIMIT_EXCEEDED" ||
+        info.reason === "MODEL_CAPACITY_EXHAUSTED",
+    ) ?? cloudCodeErrorInfos[0];
+
+  if (prioritizedErrorInfo?.reason === "QUOTA_EXHAUSTED") {
+    return { terminal: true, retryDelayMs, reason: prioritizedErrorInfo.reason };
   }
-  if (errorInfo?.reason === "RATE_LIMIT_EXCEEDED") {
-    return { terminal: false, retryDelayMs: retryDelayMs ?? 10_000, reason: errorInfo.reason };
+  if (prioritizedErrorInfo?.reason === "RATE_LIMIT_EXCEEDED") {
+    return {
+      terminal: false,
+      retryDelayMs: retryDelayMs ?? 10_000,
+      reason: prioritizedErrorInfo.reason,
+    };
   }
-  if (errorInfo?.reason === "MODEL_CAPACITY_EXHAUSTED") {
+  if (prioritizedErrorInfo?.reason === "MODEL_CAPACITY_EXHAUSTED") {
     return {
       terminal: retryDelayMs === undefined,
       retryDelayMs,
-      reason: errorInfo.reason,
+      reason: prioritizedErrorInfo.reason,
     };
   }
 
@@ -92,20 +108,31 @@ export async function classifyQuotaResponse(response: Response): Promise<QuotaCo
       .toLowerCase();
 
     if (allTexts.includes("perday") || allTexts.includes("daily") || allTexts.includes("per day")) {
-      return { terminal: true, retryDelayMs, reason: errorInfo?.reason };
+      return { terminal: true, retryDelayMs, reason: prioritizedErrorInfo?.reason };
     }
     if (allTexts.includes("perminute") || allTexts.includes("per minute")) {
-      return { terminal: false, retryDelayMs: retryDelayMs ?? 60_000, reason: errorInfo?.reason };
+      return {
+        terminal: false,
+        retryDelayMs: retryDelayMs ?? 60_000,
+        reason: prioritizedErrorInfo?.reason,
+      };
     }
-    return { terminal: false, retryDelayMs, reason: errorInfo?.reason };
+    return { terminal: false, retryDelayMs, reason: prioritizedErrorInfo?.reason };
   }
 
-  const quotaLimit = errorInfo?.metadata?.quota_limit?.toLowerCase() ?? "";
+  const quotaLimit =
+    cloudCodeErrorInfos
+      .map((info) => info.metadata?.quota_limit?.toLowerCase() ?? "")
+      .find((value) => value.length > 0) ?? "";
   if (quotaLimit.includes("perminute") || quotaLimit.includes("per minute")) {
-    return { terminal: false, retryDelayMs: retryDelayMs ?? 60_000, reason: errorInfo?.reason };
+    return {
+      terminal: false,
+      retryDelayMs: retryDelayMs ?? 60_000,
+      reason: prioritizedErrorInfo?.reason,
+    };
   }
 
-  return { terminal: false, retryDelayMs, reason: errorInfo?.reason };
+  return { terminal: false, retryDelayMs, reason: prioritizedErrorInfo?.reason };
 }
 
 /**
@@ -127,57 +154,57 @@ export async function parseRetryDelayFromBody(response: Response): Promise<numbe
       detail["@type"] === "type.googleapis.com/google.rpc.RetryInfo",
   );
   if (retryInfo?.retryDelay) {
-    const delayMs = parseRetryDelayValue(retryInfo.retryDelay);
+    const delayMs = parseSharedRetryDelayValue(retryInfo.retryDelay);
     if (delayMs !== null) {
       return delayMs;
     }
   }
 
   if (typeof payload.message === "string") {
-    return parseRetryDelayFromMessage(payload.message);
+    return parseSharedRetryDelayFromMessage(payload.message);
   }
   return null;
 }
 
-function parseRetryDelayValue(value: string | { seconds?: number; nanos?: number }): number | null {
-  if (typeof value === "string") {
-    const trimmed = value.trim();
-    if (!trimmed) {
-      return null;
-    }
-    if (trimmed.endsWith("ms")) {
-      const milliseconds = Number(trimmed.slice(0, -2));
-      return Number.isFinite(milliseconds) && milliseconds > 0 ? Math.round(milliseconds) : null;
-    }
-    const match = trimmed.match(/^([\d.]+)s$/);
-    if (!match?.[1]) {
-      return null;
-    }
-    const seconds = Number(match[1]);
-    return Number.isFinite(seconds) && seconds > 0 ? Math.round(seconds * 1000) : null;
+function parseJsonSafe(rawText: string): unknown {
+  try {
+    return JSON.parse(rawText);
+  } catch {
+    return undefined;
   }
-
-  const seconds = typeof value.seconds === "number" ? value.seconds : 0;
-  const nanos = typeof value.nanos === "number" ? value.nanos : 0;
-  if (!Number.isFinite(seconds) || !Number.isFinite(nanos)) {
-    return null;
-  }
-  const totalMs = Math.round(seconds * 1000 + nanos / 1e6);
-  return totalMs > 0 ? totalMs : null;
 }
 
-function parseRetryDelayFromMessage(message: string): number | null {
-  const retryMatch = message.match(/Please retry in ([0-9.]+(?:ms|s))/i);
-  if (retryMatch?.[1]) {
-    return parseRetryDelayValue(retryMatch[1]);
-  }
+function extractSseErrorPayloads(rawText: string): unknown[] {
+  const parsedItems: unknown[] = [];
+  const dataLines: string[] = [];
 
-  const afterMatch = message.match(/after\s+([0-9.]+(?:ms|s))/i);
-  if (afterMatch?.[1]) {
-    return parseRetryDelayValue(afterMatch[1]);
-  }
+  const flush = (): void => {
+    if (dataLines.length === 0) {
+      return;
+    }
+    const payload = dataLines.join("\n").trim();
+    dataLines.length = 0;
+    if (!payload || payload === "[DONE]") {
+      return;
+    }
+    const parsed = parseJsonSafe(payload);
+    if (parsed !== undefined) {
+      parsedItems.push(parsed);
+    }
+  };
 
-  return null;
+  for (const rawLine of rawText.split(/\r?\n/)) {
+    if (rawLine === "") {
+      flush();
+      continue;
+    }
+    if (rawLine.startsWith("data:")) {
+      dataLines.push(rawLine.slice(5).trimStart());
+    }
+  }
+  flush();
+
+  return parsedItems;
 }
 
 async function parseErrorBody(
@@ -193,38 +220,43 @@ async function parseErrorBody(
     return null;
   }
 
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    return null;
+  const directParsed = parseJsonSafe(text);
+  const candidates =
+    directParsed !== undefined ? [directParsed] : extractSseErrorPayloads(text);
+
+  for (const candidate of candidates) {
+    const normalized = normalizeErrorEnvelope(candidate);
+    if (!normalized || !isObject(normalized.error)) {
+      continue;
+    }
+
+    const error = normalized.error as Record<string, unknown>;
+    return {
+      message: typeof error.message === "string" ? error.message : undefined,
+      details: Array.isArray(error.details) ? error.details : undefined,
+    };
   }
 
-  const normalized = normalizeErrorEnvelope(parsed);
-  if (!normalized || !isObject(normalized.error)) {
-    return null;
-  }
-
-  const error = normalized.error as Record<string, unknown>;
-  return {
-    message: typeof error.message === "string" ? error.message : undefined,
-    details: Array.isArray(error.details) ? error.details : undefined,
-  };
+  return null;
 }
 
 function isObject(value: unknown): value is Record<string, any> {
-  return !!value && typeof value === "object";
+  return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
 function normalizeErrorEnvelope(parsed: unknown): Record<string, unknown> | null {
   if (Array.isArray(parsed)) {
-    const first = parsed[0];
-    return isObject(first) ? first : null;
+    const withError = parsed.find((item) => isObject(item) && isObject(item.error));
+    if (isObject(withError)) {
+      return withError;
+    }
+    const firstObject = parsed.find(isObject);
+    return isObject(firstObject) ? firstObject : null;
   }
   return isObject(parsed) ? parsed : null;
 }
 
 export const retryInternals = {
-  parseRetryDelayValue,
-  parseRetryDelayFromMessage,
+  parseRetryDelayValue: parseSharedRetryDelayValue,
+  parseRetryDelayFromMessage: parseSharedRetryDelayFromMessage,
 };

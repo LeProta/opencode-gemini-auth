@@ -1,10 +1,24 @@
+import type { GeminiThinkingMode } from "../model-config";
 import type { ThinkingConfig } from "./types";
 
+export interface NormalizeThinkingOptions {
+  thinkingMode?: GeminiThinkingMode;
+}
+
 /**
- * Normalizes thinkingConfig aliases into canonical Gemini field names.
+ * Normalizes thinkingConfig aliases into canonical Gemini field names,
+ * optionally enforcing model-family thinking mode compatibility.
  */
-export function normalizeThinkingConfig(config: unknown): ThinkingConfig | undefined {
-  if (!config || typeof config !== "object") {
+export function normalizeThinkingConfig(
+  config: unknown,
+  options?: NormalizeThinkingOptions,
+): ThinkingConfig | undefined {
+  if (!config || typeof config !== "object" || Array.isArray(config)) {
+    return undefined;
+  }
+
+  const thinkingMode = options?.thinkingMode;
+  if (thinkingMode === "none") {
     return undefined;
   }
 
@@ -18,21 +32,33 @@ export function normalizeThinkingConfig(config: unknown): ThinkingConfig | undef
     typeof levelRaw === "string" && levelRaw.trim().length > 0 ? levelRaw.trim().toLowerCase() : undefined;
   const includeThoughts = typeof includeRaw === "boolean" ? includeRaw : undefined;
 
-  if (thinkingBudget === undefined && thinkingLevel === undefined && includeThoughts === undefined) {
+  const effectiveBudget = thinkingMode === "level" ? undefined : thinkingBudget;
+  const effectiveLevel = thinkingMode === "budget" ? undefined : thinkingLevel;
+
+  if (
+    effectiveBudget === undefined &&
+    effectiveLevel === undefined &&
+    (thinkingBudget !== undefined || thinkingLevel !== undefined)
+  ) {
     return undefined;
   }
 
-  const thinkingEnabled =
-    (thinkingBudget !== undefined && thinkingBudget > 0) ||
-    thinkingLevel !== undefined;
+  if (effectiveBudget === undefined && effectiveLevel === undefined && includeThoughts === undefined) {
+    return undefined;
+  }
+
+  const budgetEnabled = effectiveBudget !== undefined && (effectiveBudget > 0 || effectiveBudget === -1);
+  const levelEnabled =
+    effectiveLevel !== undefined && effectiveLevel !== "none" && effectiveLevel !== "off";
+  const thinkingEnabled = budgetEnabled || levelEnabled;
   const finalIncludeThoughts = thinkingEnabled ? includeThoughts ?? false : false;
 
   const normalized: ThinkingConfig = {};
-  if (thinkingBudget !== undefined) {
-    normalized.thinkingBudget = thinkingBudget;
+  if (effectiveBudget !== undefined) {
+    normalized.thinkingBudget = effectiveBudget;
   }
-  if (thinkingLevel !== undefined) {
-    normalized.thinkingLevel = thinkingLevel;
+  if (effectiveLevel !== undefined) {
+    normalized.thinkingLevel = effectiveLevel;
   }
   normalized.includeThoughts = finalIncludeThoughts;
 

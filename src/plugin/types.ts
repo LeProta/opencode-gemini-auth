@@ -1,7 +1,8 @@
 import type { GeminiTokenExchangeResult } from "../gemini/oauth";
 
 export interface PluginConfig {
-  provider?: Record<string, { options?: Record<string, unknown> }>;
+  provider?: Record<string, { options?: Record<string, unknown>; settings?: Record<string, unknown> }>;
+  providers?: Record<string, { options?: Record<string, unknown>; settings?: Record<string, unknown> }>;
   command?: Record<string, { description: string; template: string }>;
   [key: string]: unknown;
 }
@@ -17,6 +18,7 @@ export interface OAuthAuthDetails {
   refresh: string;
   access?: string;
   expires?: number;
+  metadata?: Record<string, unknown>;
 }
 
 export interface NonOAuthAuthDetails {
@@ -43,6 +45,7 @@ export interface ProviderModel {
 export interface Provider {
   models?: Record<string, ProviderModel>;
   options?: Record<string, unknown>;
+  settings?: Record<string, unknown>;
 }
 
 export interface LoaderResult {

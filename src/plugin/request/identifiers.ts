@@ -6,6 +6,7 @@ const PROCESS_SESSION_ID = randomUUID();
 
 function resolveUserPromptId(payload: Record<string, unknown>, request?: Record<string, unknown>): string {
   const extra = isRecord(payload.extra_body) ? payload.extra_body : undefined;
+  const requestExtra = isRecord(request?.extra_body) ? request.extra_body : undefined;
 
   return (
     pickString(
@@ -27,12 +28,19 @@ function resolveUserPromptId(payload: Record<string, unknown>, request?: Record<
       extra?.promptId,
       extra?.request_id,
       extra?.requestId,
+      requestExtra?.user_prompt_id,
+      requestExtra?.userPromptId,
+      requestExtra?.prompt_id,
+      requestExtra?.promptId,
+      requestExtra?.request_id,
+      requestExtra?.requestId,
     ) ?? randomUUID()
   );
 }
 
 function resolveSessionId(payload: Record<string, unknown>, request?: Record<string, unknown>): string {
   const extra = isRecord(payload.extra_body) ? payload.extra_body : undefined;
+  const requestExtra = isRecord(request?.extra_body) ? request.extra_body : undefined;
   return (
     pickString(
       request?.session_id,
@@ -41,12 +49,16 @@ function resolveSessionId(payload: Record<string, unknown>, request?: Record<str
       payload.sessionId,
       extra?.session_id,
       extra?.sessionId,
+      requestExtra?.session_id,
+      requestExtra?.sessionId,
     ) ?? PROCESS_SESSION_ID
   );
 }
 
-function stripPromptIdentifierAliases(payload: Record<string, unknown>): void {
-  delete payload.user_prompt_id;
+function stripPromptIdentifierAliases(payload: Record<string, unknown>, keepCanonical = false): void {
+  if (!keepCanonical) {
+    delete payload.user_prompt_id;
+  }
   delete payload.userPromptId;
   delete payload.prompt_id;
   delete payload.promptId;
@@ -54,8 +66,27 @@ function stripPromptIdentifierAliases(payload: Record<string, unknown>): void {
   delete payload.requestId;
 }
 
-function stripSessionIdentifierAliases(payload: Record<string, unknown>): void {
+function stripSessionIdentifierAliases(payload: Record<string, unknown>, keepCanonical = false): void {
+  if (!keepCanonical) {
+    delete payload.session_id;
+  }
   delete payload.sessionId;
+}
+
+function stripExtraBodyIdentifierAliases(payload: Record<string, unknown>): void {
+  if (!isRecord(payload.extra_body)) {
+    return;
+  }
+
+  const extra = { ...payload.extra_body };
+  stripPromptIdentifierAliases(extra, false);
+  stripSessionIdentifierAliases(extra, false);
+
+  if (Object.keys(extra).length === 0) {
+    delete payload.extra_body;
+  } else {
+    payload.extra_body = extra;
+  }
 }
 
 /**
@@ -72,11 +103,15 @@ export function normalizeWrappedIdentifiers(
   const sessionId = resolveSessionId(wrapped, request);
 
   request.session_id = sessionId;
-  stripSessionIdentifierAliases(request);
+  stripSessionIdentifierAliases(request, true);
+  stripPromptIdentifierAliases(request, false);
+  stripExtraBodyIdentifierAliases(request);
   wrapped.request = request;
 
   wrapped.user_prompt_id = userPromptId;
-  stripPromptIdentifierAliases(wrapped);
+  stripPromptIdentifierAliases(wrapped, true);
+  stripSessionIdentifierAliases(wrapped, false);
+  stripExtraBodyIdentifierAliases(wrapped);
 
   return { userPromptId, sessionId };
 }
@@ -93,8 +128,9 @@ export function normalizeRequestPayloadIdentifiers(
   const sessionId = resolveSessionId(payload);
 
   payload.session_id = sessionId;
-  stripSessionIdentifierAliases(payload);
-  stripPromptIdentifierAliases(payload);
+  stripSessionIdentifierAliases(payload, true);
+  stripPromptIdentifierAliases(payload, false);
+  stripExtraBodyIdentifierAliases(payload);
 
   return { userPromptId, sessionId };
 }

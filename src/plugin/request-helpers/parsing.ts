@@ -7,27 +7,35 @@ export function parseGeminiApiBody(rawText: string): GeminiApiBody | null {
   try {
     const parsed = JSON.parse(rawText);
     if (Array.isArray(parsed)) {
-      const firstObject = parsed.find((item: unknown) => typeof item === "object" && item !== null);
-      return firstObject && typeof firstObject === "object"
+      const firstObject = parsed.find(
+        (item: unknown) => typeof item === "object" && item !== null && !Array.isArray(item),
+      );
+      return firstObject && typeof firstObject === "object" && !Array.isArray(firstObject)
         ? (firstObject as GeminiApiBody)
         : null;
     }
 
-    return parsed && typeof parsed === "object" ? (parsed as GeminiApiBody) : null;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as GeminiApiBody)
+      : null;
   } catch {
     return null;
   }
 }
 
 /**
- * Extracts usageMetadata from a response object, guarding types.
+ * Extracts usageMetadata from a wrapped response or top-level Gemini body, guarding types.
  */
 export function extractUsageMetadata(body: GeminiApiBody): GeminiUsageMetadata | null {
-  const usage = (body.response && typeof body.response === "object"
-    ? (body.response as { usageMetadata?: unknown }).usageMetadata
-    : undefined) as GeminiUsageMetadata | undefined;
+  const responseUsage =
+    body.response && typeof body.response === "object" && !Array.isArray(body.response)
+      ? (body.response as { usageMetadata?: unknown }).usageMetadata
+      : undefined;
+  const usage = (responseUsage ?? (body as { usageMetadata?: unknown }).usageMetadata) as
+    | GeminiUsageMetadata
+    | undefined;
 
-  if (!usage || typeof usage !== "object") {
+  if (!usage || typeof usage !== "object" || Array.isArray(usage)) {
     return null;
   }
 

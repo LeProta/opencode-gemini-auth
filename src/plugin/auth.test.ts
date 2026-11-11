@@ -54,5 +54,21 @@ describe("auth helpers", () => {
         expires: now + 61_000,
       }),
     ).toBe(false);
+    expect(
+      accessTokenExpired({
+        type: "oauth",
+        refresh: "refresh",
+        access: "access",
+        expires: Number.NaN,
+      }),
+    ).toBe(true);
+    expect(
+      accessTokenExpired({
+        type: "oauth",
+        refresh: "refresh",
+        access: "access",
+        expires: Number.POSITIVE_INFINITY,
+      }),
+    ).toBe(true);
   });
 });

@@ -1,16 +1,132 @@
 import { accessTokenExpired, isOAuthAuth } from "./auth";
 import { resolveCachedAuth } from "./cache";
 import { ensureProjectContext, retrieveUserQuota } from "./project";
-import type { RetrieveUserQuotaBucket } from "./project/types";
+import type { RetrieveUserQuotaBucket, RetrieveUserQuotaResponse } from "./project/types";
 import { refreshAccessToken } from "./token";
-import type { GetAuth, PluginClient } from "./types";
+import type { GetAuth, OAuthAuthDetails, PluginClient, ProjectContextResult } from "./types";
 
 export const GEMINI_QUOTA_TOOL_NAME = "gemini_quota";
+
+export type QuotaAuthResolution =
+  | { status: "uninitialized"; message?: string }
+  | { status: "not_oauth"; message?: string }
+  | { status: "ok"; auth: OAuthAuthDetails }
+  | { status: "error"; message: string };
+
+export interface GeminiQuotaReport {
+  ok: boolean;
+  text: string;
+  projectId?: string;
+  buckets?: RetrieveUserQuotaBucket[];
+}
+
+export interface RetrieveGeminiQuotaReportDependencies {
+  resolveAuth: () => Promise<QuotaAuthResolution>;
+  ensureProjectContext: (
+    auth: OAuthAuthDetails,
+    configuredProjectId?: string,
+    userAgentModel?: string,
+  ) => Promise<ProjectContextResult>;
+  getConfiguredProjectId: () => Promise<string | undefined> | string | undefined;
+  getUserAgentModel?: () => Promise<string | undefined> | string | undefined;
+  fetchUserQuota?: (
+    accessToken: string,
+    projectId: string,
+    userAgentModel?: string,
+  ) => Promise<RetrieveUserQuotaResponse | null>;
+}
+
+/**
+ * Stateless, SDK-agnostic quota lookup shared across V1 (`createGeminiQuotaTool`)
+ * and V2 (`gemini_quota` tool + `/gquota` command).
+ */
+export async function retrieveGeminiQuotaReport(
+  deps: RetrieveGeminiQuotaReportDependencies,
+): Promise<GeminiQuotaReport> {
+  let authResolution: QuotaAuthResolution;
+  try {
+    authResolution = await deps.resolveAuth();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "unknown error";
+    return { ok: false, text: `Gemini quota lookup failed: ${message}` };
+  }
+
+  if (authResolution.status === "uninitialized") {
+    return {
+      ok: false,
+      text:
+        authResolution.message ??
+        "Gemini quota is unavailable before Google auth is initialized. Authenticate with the Google provider and retry.",
+    };
+  }
+  if (authResolution.status === "not_oauth") {
+    return {
+      ok: false,
+      text:
+        authResolution.message ??
+        "Gemini quota requires OAuth with Google. Run `opencode auth login` and choose `OAuth with Google (Gemini CLI)`.",
+    };
+  }
+  if (authResolution.status === "error") {
+    return { ok: false, text: authResolution.message };
+  }
+
+  const authRecord = authResolution.auth;
+  if (!authRecord.access) {
+    return {
+      ok: false,
+      text: "Gemini quota lookup failed because no access token is available. Re-authenticate and retry.",
+    };
+  }
+
+  try {
+    const configuredProjectId = await deps.getConfiguredProjectId();
+    const userAgentModel = await deps.getUserAgentModel?.();
+    const projectContext = await deps.ensureProjectContext(
+      authRecord,
+      configuredProjectId,
+      userAgentModel,
+    );
+    if (!projectContext.effectiveProjectId) {
+      return {
+        ok: false,
+        text: "Gemini quota lookup failed because no Google Cloud project could be resolved.",
+      };
+    }
+
+    const fetchQuota = deps.fetchUserQuota ?? retrieveUserQuota;
+    const quota = await fetchQuota(
+      authRecord.access,
+      projectContext.effectiveProjectId,
+      userAgentModel,
+    );
+    if (!quota?.buckets?.length) {
+      return {
+        ok: false,
+        projectId: projectContext.effectiveProjectId,
+        text: `No Gemini quota buckets were returned for project \`${projectContext.effectiveProjectId}\`.`,
+      };
+    }
+
+    return {
+      ok: true,
+      projectId: projectContext.effectiveProjectId,
+      buckets: quota.buckets,
+      text: formatGeminiQuotaOutput(
+        projectContext.effectiveProjectId,
+        quota.buckets,
+      ),
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "unknown error";
+    return { ok: false, text: `Gemini quota lookup failed: ${message}` };
+  }
+}
 
 interface GeminiQuotaToolDependencies {
   client: PluginClient;
   getAuthResolver: () => GetAuth | undefined;
-  getConfiguredProjectId: () => string | undefined;
+  getConfiguredProjectId: () => Promise<string | undefined> | string | undefined;
   getUserAgentModel: () => string | undefined;
 }
 
@@ -25,57 +141,36 @@ export function createGeminiQuotaTool({
       "Retrieve current Gemini Code Assist quota usage for the authenticated user and project.",
     args: {},
     async execute() {
-      const getAuth = getAuthResolver();
-      if (!getAuth) {
-        return "Gemini quota is unavailable before Google auth is initialized. Authenticate with the Google provider and retry.";
-      }
-
-      const auth = await getAuth();
-      if (!isOAuthAuth(auth)) {
-        return "Gemini quota requires OAuth with Google. Run `opencode auth login` and choose `OAuth with Google (Gemini CLI)`.";
-      }
-
-      let authRecord = resolveCachedAuth(auth);
-      if (accessTokenExpired(authRecord)) {
-        const refreshed = await refreshAccessToken(authRecord, client);
-        if (!refreshed?.access) {
-          return "Gemini quota lookup failed because the access token could not be refreshed. Re-authenticate and retry.";
-        }
-        authRecord = refreshed;
-      }
-
-      if (!authRecord.access) {
-        return "Gemini quota lookup failed because no access token is available. Re-authenticate and retry.";
-      }
-
-      try {
-        const projectContext = await ensureProjectContext(
-          authRecord,
-          client,
-          getConfiguredProjectId(),
-          getUserAgentModel(),
-        );
-        if (!projectContext.effectiveProjectId) {
-          return "Gemini quota lookup failed because no Google Cloud project could be resolved.";
-        }
-
-        const quota = await retrieveUserQuota(
-          authRecord.access,
-          projectContext.effectiveProjectId,
-          getUserAgentModel(),
-        );
-        if (!quota?.buckets?.length) {
-          return `No Gemini quota buckets were returned for project \`${projectContext.effectiveProjectId}\`.`;
-        }
-
-        return formatGeminiQuotaOutput(
-          projectContext.effectiveProjectId,
-          quota.buckets,
-        );
-      } catch (error) {
-        const message = error instanceof Error ? error.message : "unknown error";
-        return `Gemini quota lookup failed: ${message}`;
-      }
+      const report = await retrieveGeminiQuotaReport({
+        resolveAuth: async (): Promise<QuotaAuthResolution> => {
+          const getAuth = getAuthResolver();
+          if (!getAuth) {
+            return { status: "uninitialized" };
+          }
+          const auth = await getAuth();
+          if (!isOAuthAuth(auth)) {
+            return { status: "not_oauth" };
+          }
+          let authRecord = resolveCachedAuth(auth);
+          if (accessTokenExpired(authRecord)) {
+            const refreshed = await refreshAccessToken(authRecord, client);
+            if (!refreshed?.access) {
+              return {
+                status: "error",
+                message:
+                  "Gemini quota lookup failed because the access token could not be refreshed. Re-authenticate and retry.",
+              };
+            }
+            authRecord = refreshed;
+          }
+          return { status: "ok", auth: authRecord };
+        },
+        ensureProjectContext: (auth, configuredProjectId, userAgentModel) =>
+          ensureProjectContext(auth, client, configuredProjectId, userAgentModel),
+        getConfiguredProjectId,
+        getUserAgentModel,
+      });
+      return report.text;
     },
   };
 }

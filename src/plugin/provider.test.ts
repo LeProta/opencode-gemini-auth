@@ -4,6 +4,8 @@ import {
   resolveConfiguredProjectId,
   resolveConfiguredProjectIdFromClient,
   resolveConfiguredProjectIdFromConfig,
+  resolveConfiguredProjectIdFromProvider,
+  resolveThinkingConfigDefaults,
 } from "./provider";
 import type { PluginClient, PluginConfig, Provider } from "./types";
 
@@ -77,5 +79,80 @@ describe("resolveConfiguredProjectId", () => {
     } satisfies PluginClient;
 
     await expect(resolveConfiguredProjectIdFromClient(client)).resolves.toBe("live-config-project");
+  });
+
+  it("supports V2 provider settings and providers.google.settings", () => {
+    const v2Provider = {
+      settings: {
+        projectId: "  v2-provider-project  ",
+      },
+      models: {},
+    } satisfies Provider;
+
+    expect(resolveConfiguredProjectIdFromProvider(v2Provider)).toBe("v2-provider-project");
+    expect(
+      resolveConfiguredProjectId({
+        provider: v2Provider,
+        env: {},
+      }),
+    ).toBe("v2-provider-project");
+
+    const v2Config = {
+      providers: {
+        google: {
+          settings: {
+            projectId: "v2-config-project",
+          },
+        },
+      },
+    } satisfies PluginConfig;
+
+    expect(resolveConfiguredProjectIdFromConfig(v2Config)).toBe("v2-config-project");
+  });
+});
+
+describe("resolveThinkingConfigDefaults", () => {
+  it("extracts V1 options and V2 settings thinkingConfig defaults for provider and models", () => {
+    const v1Provider = {
+      options: {
+        thinkingConfig: { thinkingBudget: 1024 },
+      },
+      models: {
+        "gemini-2.5-pro": {
+          options: {
+            thinkingConfig: { thinkingBudget: 4096 },
+          },
+        },
+      },
+    } satisfies Provider;
+
+    expect(resolveThinkingConfigDefaults(v1Provider)).toEqual({
+      provider: { thinkingBudget: 1024 },
+      models: {
+        "gemini-2.5-pro": { thinkingBudget: 4096 },
+      },
+    });
+
+    const v2Provider = {
+      settings: {
+        thinkingConfig: { thinkingLevel: "high" },
+      },
+      models: {
+        "gemini-3-flash-preview": {
+          settings: {
+            thinkingConfig: { includeThoughts: true },
+          },
+        },
+      },
+    } satisfies Provider;
+
+    expect(resolveThinkingConfigDefaults(v2Provider)).toEqual({
+      provider: { thinkingLevel: "high" },
+      models: {
+        "gemini-3-flash-preview": { includeThoughts: true },
+      },
+    });
+
+    expect(resolveThinkingConfigDefaults({ models: {} })).toBeUndefined();
   });
 });

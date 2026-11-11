@@ -61,6 +61,7 @@ export interface GoogleRpcHelp {
 export interface GoogleRpcQuotaFailure {
   "@type"?: string;
   violations?: Array<{
+    quotaId?: string;
     subject?: string;
     description?: string;
   }>;
@@ -75,4 +76,5 @@ export const CLOUDCODE_DOMAINS = [
   "cloudcode-pa.googleapis.com",
   "staging-cloudcode-pa.googleapis.com",
   "autopush-cloudcode-pa.googleapis.com",
+  "cloudaicompanion.googleapis.com",
 ];

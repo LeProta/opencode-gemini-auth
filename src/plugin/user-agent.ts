@@ -41,8 +41,8 @@ export function getGeminiCliVersion(): string {
 
   const moduleDir = dirname(fileURLToPath(import.meta.url));
   const candidatePaths = [
-    join(moduleDir, "../../package.json"),
     join(moduleDir, "../package.json"),
+    join(moduleDir, "../../package.json"),
     join(process.cwd(), "package.json"),
   ];
 
@@ -66,7 +66,8 @@ export function getGeminiCliVersion(): string {
  * Builds a Gemini CLI-style User-Agent string.
  */
 export function buildGeminiCliUserAgent(model?: string): string {
-  const modelSegment = model?.trim() || GEMINI_CLI_DEFAULT_MODEL;
+  const normalizedModel = model?.trim().replace(/^models\//, "");
+  const modelSegment = normalizedModel || GEMINI_CLI_DEFAULT_MODEL;
   const platformSegment = `${process.platform}; ${process.arch}; ${getGeminiCliSurface()}`;
   return `${GEMINI_CLI_UA_NAME}/${getGeminiCliVersion()}/${modelSegment} (${platformSegment})`;
 }

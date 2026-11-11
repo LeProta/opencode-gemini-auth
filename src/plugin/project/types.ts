@@ -64,7 +64,7 @@ export interface RetrieveUserQuotaResponse {
 export class ProjectIdRequiredError extends Error {
   constructor() {
     super(
-      "Google Gemini requires a Google Cloud project. Enable the Gemini for Google Cloud API on a project you control, then set `provider.google.options.projectId` in your Opencode config (or set OPENCODE_GEMINI_PROJECT_ID / GOOGLE_CLOUD_PROJECT).",
+      "Google Gemini requires a Google Cloud project for Gemini Code Assist Standard/Enterprise/Workspace accounts. Enable the Gemini for Google Cloud API (`cloudaicompanion.googleapis.com`) on a project you control, then set `provider.google.options.projectId` (OpenCode V1) or `providers.google.settings.projectId` (OpenCode V2) in your OpenCode config (or set OPENCODE_GEMINI_PROJECT_ID / GOOGLE_CLOUD_PROJECT).",
     );
   }
 }

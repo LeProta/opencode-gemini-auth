@@ -6,7 +6,40 @@ import {
   rewriteGeminiPreviewAccessError,
   type GeminiApiBody,
 } from "../request-helpers";
-import { injectResponseIdFromTrace } from "./shared";
+import { injectResponseIdFromTrace, isRecord } from "./shared";
+
+function parseGeminiSseBody(rawText: string): GeminiApiBody | null {
+  const dataLines: string[] = [];
+  let lastParsed: GeminiApiBody | null = null;
+
+  const flush = (): void => {
+    if (dataLines.length === 0) {
+      return;
+    }
+    const payload = dataLines.join("\n").trim();
+    dataLines.length = 0;
+    if (!payload || payload === "[DONE]") {
+      return;
+    }
+    const parsed = parseGeminiApiBody(payload);
+    if (parsed) {
+      lastParsed = parsed;
+    }
+  };
+
+  for (const rawLine of rawText.split(/\r?\n/)) {
+    if (rawLine === "") {
+      flush();
+      continue;
+    }
+    if (rawLine.startsWith("data:")) {
+      dataLines.push(rawLine.slice(5).trimStart());
+    }
+  }
+  flush();
+
+  return lastParsed;
+}
 
 /**
  * Normalizes Gemini responses, preserving request metadata and usage counters.
@@ -28,8 +61,11 @@ export async function transformGeminiResponse(
     return response;
   }
 
+  let bufferedText: string | null = null;
   try {
     const headers = new Headers(response.headers);
+    headers.delete("content-length");
+    headers.delete("content-encoding");
 
     if (streaming && response.ok && isEventStreamResponse && response.body) {
       logGeminiDebugResponse(debugContext, response, {
@@ -45,14 +81,20 @@ export async function transformGeminiResponse(
     }
 
     const text = await response.text();
+    bufferedText = text;
     const init = {
       status: response.status,
       statusText: response.statusText,
       headers,
     };
 
-    const parsed: GeminiApiBody | null = !streaming || !isEventStreamResponse ? parseGeminiApiBody(text) : null;
-    const enhanced = !response.ok && parsed ? enhanceGeminiErrorResponse(parsed, response.status) : null;
+    const parsedJson = parseGeminiApiBody(text);
+    const parsedFromSse =
+      !parsedJson && isEventStreamResponse ? parseGeminiSseBody(text) : null;
+    const parsed = parsedJson ?? parsedFromSse;
+
+    const enhanced =
+      !response.ok && parsed ? enhanceGeminiErrorResponse(parsed, response.status) : null;
     if (enhanced?.retryAfterMs) {
       const retryAfterSec = Math.ceil(enhanced.retryAfterMs / 1000).toString();
       headers.set("Retry-After", retryAfterSec);
@@ -65,8 +107,8 @@ export async function transformGeminiResponse(
 
     const effectiveBodyRaw = previewPatched ?? enhanced?.body ?? parsed ?? undefined;
     const effectiveBody =
-      effectiveBodyRaw && typeof effectiveBodyRaw === "object"
-        ? injectResponseIdFromTrace(effectiveBodyRaw as Record<string, unknown>)
+      effectiveBodyRaw && isRecord(effectiveBodyRaw)
+        ? injectResponseIdFromTrace(effectiveBodyRaw)
         : effectiveBodyRaw;
 
     attachUsageHeaders(headers, effectiveBody);
@@ -81,11 +123,24 @@ export async function transformGeminiResponse(
       return new Response(text, init);
     }
 
-    if (effectiveBody && typeof effectiveBody === "object" && "response" in effectiveBody) {
-      return new Response(JSON.stringify((effectiveBody as { response: unknown }).response), init);
+    if (effectiveBody && isRecord(effectiveBody) && "response" in effectiveBody) {
+      if (isEventStreamResponse) {
+        headers.set("content-type", "application/json; charset=utf-8");
+      }
+      return new Response(JSON.stringify(effectiveBody.response), init);
     }
-    if (previewPatched) {
-      return new Response(JSON.stringify(previewPatched), init);
+
+    const wasModified =
+      Boolean(enhanced?.body) ||
+      Boolean(previewPatched) ||
+      (effectiveBody !== undefined && effectiveBody !== parsed) ||
+      Boolean(parsedFromSse);
+
+    if (effectiveBody && wasModified) {
+      if (isEventStreamResponse) {
+        headers.set("content-type", "application/json; charset=utf-8");
+      }
+      return new Response(JSON.stringify(effectiveBody), init);
     }
 
     return new Response(text, init);
@@ -95,20 +150,32 @@ export async function transformGeminiResponse(
       note: "Failed to transform Gemini response",
     });
     console.error("Failed to transform Gemini response:", error);
+    if (bufferedText !== null) {
+      const fallbackHeaders = new Headers(response.headers);
+      fallbackHeaders.delete("content-length");
+      fallbackHeaders.delete("content-encoding");
+      return new Response(bufferedText, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: fallbackHeaders,
+      });
+    }
     return response;
   }
 }
 
 function attachUsageHeaders(headers: Headers, effectiveBody: unknown): void {
-  if (!effectiveBody || typeof effectiveBody !== "object") {
+  if (!isRecord(effectiveBody)) {
     return;
   }
   const usage = extractUsageMetadata(effectiveBody as GeminiApiBody);
-  if (usage?.cachedContentTokenCount === undefined) {
+  if (!usage) {
     return;
   }
 
-  headers.set("x-gemini-cached-content-token-count", String(usage.cachedContentTokenCount));
+  if (usage.cachedContentTokenCount !== undefined) {
+    headers.set("x-gemini-cached-content-token-count", String(usage.cachedContentTokenCount));
+  }
   if (usage.totalTokenCount !== undefined) {
     headers.set("x-gemini-total-token-count", String(usage.totalTokenCount));
   }
@@ -124,7 +191,57 @@ function transformStreamingPayloadStream(stream: ReadableStream<Uint8Array>): Re
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
   let buffer = "";
+  let pendingDataLines: string[] = [];
+  let pendingOtherLines: string[] = [];
+  let pendingLineEnding = "\n";
   let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+
+  const flushEvent = (
+    controller: ReadableStreamDefaultController<Uint8Array>,
+    trailingSeparator: string,
+  ): void => {
+    const hasData = pendingDataLines.length > 0;
+    const hasOther = pendingOtherLines.length > 0;
+    if (!hasData && !hasOther) {
+      if (trailingSeparator) {
+        controller.enqueue(encoder.encode(trailingSeparator));
+      }
+      return;
+    }
+
+    const outputLines: string[] = [...pendingOtherLines];
+    if (hasData) {
+      const joinedData = pendingDataLines.join("\n").trim();
+      outputLines.push(transformStreamingDataPayload(joinedData));
+    }
+
+    pendingDataLines = [];
+    pendingOtherLines = [];
+    controller.enqueue(encoder.encode(`${outputLines.join(pendingLineEnding)}${trailingSeparator}`));
+  };
+
+  const processLine = (
+    rawLine: string,
+    lineEnding: string,
+    controller: ReadableStreamDefaultController<Uint8Array>,
+  ): void => {
+    if (rawLine === "") {
+      const separator = lineEnding ? `${pendingLineEnding}${lineEnding}` : pendingLineEnding;
+      flushEvent(controller, separator);
+      pendingLineEnding = "\n";
+      return;
+    }
+    if (lineEnding) {
+      pendingLineEnding = lineEnding;
+    } else if (pendingDataLines.length === 0 && pendingOtherLines.length === 0) {
+      pendingLineEnding = "";
+    }
+    if (rawLine.startsWith("data:")) {
+      pendingDataLines.push(rawLine.slice(5).trimStart());
+      return;
+    }
+    pendingOtherLines.push(rawLine);
+  };
 
   return new ReadableStream<Uint8Array>({
     start(controller) {
@@ -136,8 +253,11 @@ function transformStreamingPayloadStream(stream: ReadableStream<Uint8Array>): Re
             if (done) {
               buffer += decoder.decode();
               if (buffer.length > 0) {
-                controller.enqueue(encoder.encode(transformStreamingLine(buffer)));
+                const rawLine = buffer.endsWith("\r") ? buffer.slice(0, -1) : buffer;
+                buffer = "";
+                processLine(rawLine, "", controller);
               }
+              flushEvent(controller, pendingLineEnding);
               controller.close();
               return;
             }
@@ -149,8 +269,7 @@ function transformStreamingPayloadStream(stream: ReadableStream<Uint8Array>): Re
               buffer = buffer.slice(newlineIndex + 1);
               const hasCr = line.endsWith("\r");
               const rawLine = hasCr ? line.slice(0, -1) : line;
-              const transformed = transformStreamingLine(rawLine);
-              controller.enqueue(encoder.encode(`${transformed}${hasCr ? "\r\n" : "\n"}`));
+              processLine(rawLine, hasCr ? "\r\n" : "\n", controller);
               newlineIndex = buffer.indexOf("\n");
             }
             pump();
@@ -169,23 +288,22 @@ function transformStreamingPayloadStream(stream: ReadableStream<Uint8Array>): Re
   });
 }
 
-function transformStreamingLine(line: string): string {
-  if (!line.startsWith("data:")) {
-    return line;
-  }
-  const json = line.slice(5).trim();
-  if (!json) {
-    return line;
+function transformStreamingDataPayload(json: string): string {
+  if (!json || json === "[DONE]") {
+    return json ? `data: ${json}` : "data:";
   }
 
   try {
-    const parsed = JSON.parse(json) as Record<string, unknown>;
+    const parsed: unknown = JSON.parse(json);
+    if (!isRecord(parsed)) {
+      return `data: ${json}`;
+    }
     const patched = injectResponseIdFromTrace(parsed);
     if (patched.response !== undefined) {
       return `data: ${JSON.stringify(patched.response)}`;
     }
+    return `data: ${JSON.stringify(patched)}`;
   } catch {
-    return line;
+    return `data: ${json}`;
   }
-  return line;
 }

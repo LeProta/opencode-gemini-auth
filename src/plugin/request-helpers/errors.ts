@@ -78,15 +78,28 @@ export function enhanceGeminiErrorResponse(
   if (status === 429) {
     const quotaInfo = extractQuotaInfo(details);
     if (quotaInfo) {
-      const message = quotaInfo.retryable
-        ? `Rate limit exceeded. ${retryAfterMs ? "Please retry shortly." : "Please retry."}`
-        : "Quota exhausted for this account. Please wait for your quota to reset or upgrade your plan.";
+      const rawMessage = typeof error.message === "string" ? error.message.trim() : "";
+      const isGenericMessage =
+        !rawMessage ||
+        /^(?:rate limit(?:ed)?|quota exhausted|rate limit exceeded)$/i.test(rawMessage);
+      const detailSuffix = !isGenericMessage ? ` (${rawMessage})` : "";
+
+      let baseMessage: string;
+      if (!quotaInfo.retryable) {
+        baseMessage =
+          "Quota exhausted (quota exceeded) for this account. Please wait for your quota to reset or upgrade your plan.";
+      } else if (quotaInfo.reason === "MODEL_CAPACITY_EXHAUSTED") {
+        baseMessage = `Model capacity temporarily exhausted. ${retryAfterMs ? "Please retry shortly." : "Please retry."}`;
+      } else {
+        baseMessage = `Rate limit exceeded. ${retryAfterMs ? "Please retry shortly." : "Please retry."}`;
+      }
+
       return {
         body: {
           ...body,
           error: {
             ...error,
-            message,
+            message: `${baseMessage}${detailSuffix}`,
           },
         },
         retryAfterMs,
@@ -115,20 +128,24 @@ function isGeminiThreeModel(target?: string): boolean {
   return !!target && /gemini[\s-]?3/i.test(target);
 }
 
+function isErrorInfoDetail(detail: unknown): detail is GoogleRpcErrorInfo {
+  return (
+    typeof detail === "object" &&
+    detail !== null &&
+    (detail as GoogleRpcErrorInfo)["@type"] === "type.googleapis.com/google.rpc.ErrorInfo"
+  );
+}
+
 function extractValidationInfo(details: unknown[]): { link?: string; learnMore?: string } | null {
   const errorInfo = details.find(
     (detail): detail is GoogleRpcErrorInfo =>
-      typeof detail === "object" &&
-      detail !== null &&
-      (detail as GoogleRpcErrorInfo)["@type"] === "type.googleapis.com/google.rpc.ErrorInfo",
+      isErrorInfoDetail(detail) &&
+      detail.reason === "VALIDATION_REQUIRED" &&
+      typeof detail.domain === "string" &&
+      CLOUDCODE_DOMAINS.includes(detail.domain),
   );
 
-  if (
-    !errorInfo ||
-    errorInfo.reason !== "VALIDATION_REQUIRED" ||
-    !errorInfo.domain ||
-    !CLOUDCODE_DOMAINS.includes(errorInfo.domain)
-  ) {
+  if (!errorInfo) {
     return null;
   }
 
@@ -142,7 +159,6 @@ function extractValidationInfo(details: unknown[]): { link?: string; learnMore?:
   let link: string | undefined;
   let learnMore: string | undefined;
   if (helpDetail?.links && helpDetail.links.length > 0) {
-    link = helpDetail.links[0]?.url;
     const learnMoreLink = helpDetail.links.find((candidate) => {
       if (!candidate?.url) {
         return false;
@@ -157,6 +173,7 @@ function extractValidationInfo(details: unknown[]): { link?: string; learnMore?:
       }
     });
     learnMore = learnMoreLink?.url;
+    link = helpDetail.links.find((candidate) => candidate?.url && candidate !== learnMoreLink)?.url;
   }
 
   if (!link && errorInfo.metadata?.validation_link) {
@@ -166,19 +183,18 @@ function extractValidationInfo(details: unknown[]): { link?: string; learnMore?:
   return link || learnMore ? { link, learnMore } : null;
 }
 
-function extractQuotaInfo(details: unknown[]): { retryable: boolean } | null {
-  const errorInfo = details.find(
-    (detail): detail is GoogleRpcErrorInfo =>
-      typeof detail === "object" &&
-      detail !== null &&
-      (detail as GoogleRpcErrorInfo)["@type"] === "type.googleapis.com/google.rpc.ErrorInfo",
-  );
-
-  if (errorInfo?.reason === "RATE_LIMIT_EXCEEDED") {
-    return { retryable: true };
-  }
-  if (errorInfo?.reason === "QUOTA_EXHAUSTED") {
-    return { retryable: false };
+function extractQuotaInfo(details: unknown[]): { retryable: boolean; reason?: string } | null {
+  const errorInfos = details.filter(isErrorInfoDetail);
+  for (const errorInfo of errorInfos) {
+    if (errorInfo.reason === "RATE_LIMIT_EXCEEDED") {
+      return { retryable: true, reason: "RATE_LIMIT_EXCEEDED" };
+    }
+    if (errorInfo.reason === "MODEL_CAPACITY_EXHAUSTED") {
+      return { retryable: true, reason: "MODEL_CAPACITY_EXHAUSTED" };
+    }
+    if (errorInfo.reason === "QUOTA_EXHAUSTED") {
+      return { retryable: false, reason: "QUOTA_EXHAUSTED" };
+    }
   }
 
   const quotaFailure = details.find(
@@ -192,11 +208,15 @@ function extractQuotaInfo(details: unknown[]): { retryable: boolean } | null {
     return null;
   }
 
-  const description = quotaFailure.violations
-    .map((violation) => violation.description?.toLowerCase() ?? "")
+  const violationText = quotaFailure.violations
+    .map((violation) => `${violation.quotaId ?? ""} ${violation.description ?? ""}`.toLowerCase())
     .join(" ");
-  if (description.includes("daily") || description.includes("per day")) {
-    return { retryable: false };
+  if (
+    violationText.includes("daily") ||
+    violationText.includes("per day") ||
+    violationText.includes("perday")
+  ) {
+    return { retryable: false, reason: "QUOTA_EXHAUSTED" };
   }
   return { retryable: true };
 }
@@ -216,11 +236,18 @@ function extractRetryDelay(details: unknown[], errorMessage?: string): number | 
     }
   }
 
+  return parseRetryDelayFromMessage(errorMessage);
+}
+
+/**
+ * Extracts a retry delay in milliseconds from free-form error text.
+ */
+export function parseRetryDelayFromMessage(errorMessage?: string): number | null {
   if (!errorMessage) {
     return null;
   }
 
-  const retryMatch = errorMessage.match(/Please retry in ([0-9.]+(?:ms|s))/);
+  const retryMatch = errorMessage.match(/Please retry in ([0-9.]+(?:ms|s))/i);
   if (retryMatch?.[1]) {
     return parseRetryDelayValue(retryMatch[1]);
   }
@@ -232,7 +259,12 @@ function extractRetryDelay(details: unknown[], errorMessage?: string): number | 
   return null;
 }
 
-function parseRetryDelayValue(value: string | { seconds?: number; nanos?: number }): number | null {
+/**
+ * Parses Google RPC RetryInfo delay strings ("1.5s", "250ms") or duration objects into ms.
+ */
+export function parseRetryDelayValue(
+  value: string | { seconds?: number; nanos?: number },
+): number | null {
   if (typeof value === "string") {
     const trimmed = value.trim();
     if (!trimmed) {

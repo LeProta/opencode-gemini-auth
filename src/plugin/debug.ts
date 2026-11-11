@@ -1,12 +1,21 @@
-import { createWriteStream } from "node:fs";
-import { join } from "node:path";
-import { cwd, env } from "node:process";
+import { appendFileSync, mkdirSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { env } from "node:process";
+import { redact, redactString } from "./logger";
+import { getGeminiPluginDataDir } from "./storage-paths";
 
-const DEBUG_FLAG = env.OPENCODE_GEMINI_DEBUG ?? "";
 const MAX_BODY_PREVIEW_CHARS = 2000;
-const debugEnabled = DEBUG_FLAG.trim() === "1";
-const logFilePath = debugEnabled ? defaultLogFilePath() : undefined;
-const logWriter = createLogWriter(logFilePath);
+const SENSITIVE_HEADER_KEYS = new Set([
+  "authorization",
+  "proxy-authorization",
+  "x-api-key",
+  "x-goog-api-key",
+  "cookie",
+  "set-cookie",
+]);
+
+let cachedLogDir: string | undefined;
+let cachedLogFilePath: string | undefined;
 
 export interface GeminiDebugContext {
   id: string;
@@ -37,17 +46,17 @@ let requestCounter = 0;
  * Returns true when Gemini debug logging is enabled.
  */
 export function isGeminiDebugEnabled(): boolean {
-  return debugEnabled;
+  return (env.OPENCODE_GEMINI_DEBUG ?? "").trim() === "1";
 }
 
 /**
  * Writes an arbitrary debug line when debugging is enabled.
  */
 export function logGeminiDebugMessage(message: string): void {
-  if (!debugEnabled) {
+  if (!isGeminiDebugEnabled()) {
     return;
   }
-  logDebug(`[Gemini Debug] ${message}`);
+  logDebug(`[Gemini Debug] ${redactString(message)}`);
 }
 
 /**
@@ -64,15 +73,17 @@ export function formatDebugBodyPreview(text?: string | null): string | undefined
  * Begins a debug trace for a Gemini request, logging request metadata when debugging is enabled.
  */
 export function startGeminiDebugRequest(meta: GeminiDebugRequestMeta): GeminiDebugContext | null {
-  if (!debugEnabled) {
+  if (!isGeminiDebugEnabled()) {
     return null;
   }
 
   const id = `GEMINI-${++requestCounter}`;
   const method = meta.method ?? "GET";
-  logDebug(`[Gemini Debug ${id}] ${method} ${meta.resolvedUrl}`);
-  if (meta.originalUrl && meta.originalUrl !== meta.resolvedUrl) {
-    logDebug(`[Gemini Debug ${id}] Original URL: ${meta.originalUrl}`);
+  const safeResolvedUrl = redactString(meta.resolvedUrl);
+  const safeOriginalUrl = meta.originalUrl ? redactString(meta.originalUrl) : "";
+  logDebug(`[Gemini Debug ${id}] ${method} ${safeResolvedUrl}`);
+  if (safeOriginalUrl && safeOriginalUrl !== safeResolvedUrl) {
+    logDebug(`[Gemini Debug ${id}] Original URL: ${safeOriginalUrl}`);
   }
   if (meta.projectId) {
     logDebug(`[Gemini Debug ${id}] Project: ${meta.projectId}`);
@@ -95,7 +106,7 @@ export function logGeminiDebugResponse(
   response: Response,
   meta: GeminiDebugResponseMeta = {},
 ): void {
-  if (!debugEnabled || !context) {
+  if (!isGeminiDebugEnabled() || !context) {
     return;
   }
 
@@ -140,10 +151,10 @@ function maskHeaders(headers?: HeadersInit | Headers): Record<string, string> {
   const result: Record<string, string> = {};
   const parsed = headers instanceof Headers ? headers : new Headers(headers);
   parsed.forEach((value, key) => {
-    if (key.toLowerCase() === "authorization") {
+    if (SENSITIVE_HEADER_KEYS.has(key.toLowerCase())) {
       result[key] = "[redacted]";
     } else {
-      result[key] = value;
+      result[key] = redactString(value);
     }
   });
   return result;
@@ -208,51 +219,49 @@ function formatBodyPreview(body?: BodyInit | null): string | undefined {
  * Truncates long strings to a fixed preview length for logging.
  */
 function truncateForLog(text: string): string {
-  if (text.length <= MAX_BODY_PREVIEW_CHARS) {
-    return text;
+  const safeText = redactString(text);
+  if (safeText.length <= MAX_BODY_PREVIEW_CHARS) {
+    return safeText;
   }
-  return `${text.slice(0, MAX_BODY_PREVIEW_CHARS)}... (truncated ${text.length - MAX_BODY_PREVIEW_CHARS} chars)`;
+  return `${safeText.slice(0, MAX_BODY_PREVIEW_CHARS)}... (truncated ${safeText.length - MAX_BODY_PREVIEW_CHARS} chars)`;
 }
 
 /**
- * Writes a single debug line using the configured writer.
+ * Writes a single debug line lazily to the plugin log directory.
  */
 function logDebug(line: string): void {
-  logWriter(line);
+  const filePath = resolveDebugLogFilePath();
+  try {
+    mkdirSync(dirname(filePath), { recursive: true });
+    appendFileSync(filePath, `${redactString(line)}\n`, "utf8");
+  } catch {
+    // Best-effort debug logging must never abort requests.
+  }
 }
 
 /**
- * Converts unknown error-like values into printable strings.
+ * Converts unknown error-like values into printable, redacted strings.
  */
 function formatError(error: unknown): string {
   if (error instanceof Error) {
-    return error.stack ?? error.message;
+    return redactString(error.stack ?? error.message);
   }
   try {
-    return JSON.stringify(error);
+    return JSON.stringify(redact(error));
   } catch {
-    return String(error);
+    return redactString(String(error));
   }
 }
 
 /**
- * Builds a timestamped log file path in the current working directory.
+ * Resolves a timestamped log file path inside the plugin data directory.
  */
-function defaultLogFilePath(): string {
-  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-  return join(cwd(), `gemini-debug-${timestamp}.log`);
-}
-
-/**
- * Creates a line writer that appends to a file when provided.
- */
-function createLogWriter(filePath?: string): (line: string) => void {
-  if (!filePath) {
-    return () => {};
+function resolveDebugLogFilePath(): string {
+  const logDir = join(getGeminiPluginDataDir(), "logs");
+  if (!cachedLogFilePath || cachedLogDir !== logDir) {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    cachedLogDir = logDir;
+    cachedLogFilePath = join(logDir, `gemini-debug-${timestamp}.log`);
   }
-
-  const stream = createWriteStream(filePath, { flags: "a" });
-  return (line: string) => {
-    stream.write(`${line}\n`);
-  };
+  return cachedLogFilePath;
 }

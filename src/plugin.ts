@@ -14,12 +14,12 @@ import {
   resolveConfiguredProjectId,
   resolveConfiguredProjectIdFromClient,
   resolveConfiguredProjectIdFromConfig,
+  resolveThinkingConfigDefaults,
 } from "./plugin/provider";
 import {
   isGenerativeLanguageRequest,
   parseGenerativeLanguageRequest,
   prepareGeminiRequest,
-  type ThinkingConfigDefaults,
   transformGeminiResponse,
 } from "./plugin/request";
 import { fetchWithRetry } from "./plugin/retry";
@@ -106,7 +106,13 @@ export const GeminiCLIOAuthPlugin = async (
 
             let authRecord = resolveCachedAuth(latestAuth);
             if (accessTokenExpired(authRecord)) {
-              const refreshed = await refreshAccessToken(authRecord, client);
+              const refreshed = await refreshAccessToken(authRecord, client, {
+                signal: init?.signal ?? undefined,
+                readLatest: async () => {
+                  const current = await getAuth();
+                  return isOAuthAuth(current) ? current : undefined;
+                },
+              });
               if (!refreshed) {
                 return geminiFetch(input, init);
               }
@@ -232,34 +238,6 @@ function normalizeProviderModelCosts(provider: Provider): void {
     };
     model.cost = normalizedCost;
   }
-}
-
-function resolveThinkingConfigDefaults(provider: Provider): ThinkingConfigDefaults | undefined {
-  const providerOptions =
-    provider && typeof provider === "object"
-      ? ((provider as { options?: Record<string, unknown> }).options ?? undefined)
-      : undefined;
-  const providerThinkingConfig = providerOptions?.thinkingConfig;
-
-  const modelThinkingConfigByModel: Record<string, unknown> = {};
-  for (const [modelId, model] of Object.entries(provider.models ?? {})) {
-    if (!model || typeof model !== "object") {
-      continue;
-    }
-    const modelOptions = (model as { options?: Record<string, unknown> }).options;
-    if (modelOptions && typeof modelOptions === "object" && "thinkingConfig" in modelOptions) {
-      modelThinkingConfigByModel[modelId] = modelOptions.thinkingConfig;
-    }
-  }
-
-  if (providerThinkingConfig === undefined && Object.keys(modelThinkingConfigByModel).length === 0) {
-    return undefined;
-  }
-
-  return {
-    provider: providerThinkingConfig,
-    models: modelThinkingConfigByModel,
-  };
 }
 
 async function ensureProjectContextOrThrow(

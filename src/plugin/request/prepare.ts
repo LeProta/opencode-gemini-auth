@@ -2,11 +2,21 @@ import { randomUUID } from "node:crypto";
 
 import { GEMINI_CODE_ASSIST_ENDPOINT } from "../../constants";
 import { createGeminiActivityRequestId } from "../activity-request-id";
+import { getGeminiModelCapabilities, type GeminiThinkingMode } from "../model-config";
 import { normalizeThinkingConfig } from "../request-helpers";
 import { buildGeminiCliUserAgent } from "../user-agent";
 import { normalizeRequestPayloadIdentifiers, normalizeWrappedIdentifiers } from "./identifiers";
-import { addThoughtSignaturesToFunctionCalls, transformOpenAIToolCalls } from "./openai";
-import { isGenerativeLanguageRequest, parseGenerativeLanguageRequest } from "./shared";
+import {
+  addThoughtSignaturesToFunctionCalls,
+  repairGeminiToolPairs,
+  transformOpenAIToolCalls,
+} from "./openai";
+import {
+  isGenerativeLanguageRequest,
+  isRecord,
+  parseGenerativeLanguageRequest,
+  readString,
+} from "./shared";
 
 const STREAM_ACTION = "streamGenerateContent";
 
@@ -31,9 +41,24 @@ export function prepareGeminiRequest(
   requestedModel?: string;
 } {
   const baseInit: RequestInit = { ...init };
-  const headers = new Headers(init?.headers ?? {});
+  const resolvedHeadersSource =
+    init?.headers !== undefined
+      ? init.headers
+      : input instanceof Request
+        ? input.headers
+        : undefined;
+  const headers = new Headers(resolvedHeadersSource);
 
   if (!isGenerativeLanguageRequest(input)) {
+    return {
+      request: input,
+      init: { ...baseInit, headers },
+      streaming: false,
+    };
+  }
+
+  const requestTarget = parseGenerativeLanguageRequest(input);
+  if (!requestTarget) {
     return {
       request: input,
       init: { ...baseInit, headers },
@@ -45,15 +70,6 @@ export function prepareGeminiRequest(
   headers.delete("x-api-key");
   headers.delete("x-goog-api-key");
 
-  const requestTarget = parseGenerativeLanguageRequest(input);
-  if (!requestTarget) {
-    return {
-      request: input,
-      init: { ...baseInit, headers },
-      streaming: false,
-    };
-  }
-
   const { requestedModel: rawModel, effectiveModel, action: rawAction } = requestTarget;
   const streaming = rawAction === STREAM_ACTION;
   const transformedUrl = `${GEMINI_CODE_ASSIST_ENDPOINT}/v1internal:${rawAction}${
@@ -61,7 +77,7 @@ export function prepareGeminiRequest(
   }`;
 
   let body = baseInit.body;
-  let activityRequestId = createGeminiActivityRequestId();
+  const activityRequestId = createGeminiActivityRequestId();
 
   if (typeof baseInit.body === "string" && baseInit.body) {
     const transformed = transformRequestBody(
@@ -99,6 +115,36 @@ export function prepareGeminiRequest(
   };
 }
 
+function sanitizeRequestPayload(
+  requestPayload: Record<string, unknown>,
+  effectiveModel: string,
+  requestedModel: string,
+  thinkingConfigDefaults?: ThinkingConfigDefaults,
+): void {
+  const capabilities = getGeminiModelCapabilities(effectiveModel);
+  const thinkingMode =
+    capabilities.family === "unknown" ? undefined : capabilities.thinkingMode;
+
+  transformOpenAIToolCalls(requestPayload, effectiveModel);
+  stripThoughtPartsFromHistory(requestPayload);
+  if (Array.isArray(requestPayload.contents)) {
+    requestPayload.contents = repairGeminiToolPairs(requestPayload.contents, effectiveModel);
+  }
+  addThoughtSignaturesToFunctionCalls(requestPayload, effectiveModel);
+  normalizeThinking(
+    requestPayload,
+    resolveDefaultThinkingConfig(thinkingConfigDefaults, requestedModel, effectiveModel),
+    thinkingConfigDefaults?.provider,
+    thinkingMode,
+  );
+  normalizeSystemInstruction(requestPayload);
+  normalizeCachedContent(requestPayload);
+
+  if ("model" in requestPayload) {
+    delete requestPayload.model;
+  }
+}
+
 function transformRequestBody(
   body: string,
   projectId: string,
@@ -108,33 +154,36 @@ function transformRequestBody(
 ): { body?: string; userPromptId: string } {
   const fallbackId = randomUUID();
   try {
-    const parsedBody = JSON.parse(body) as Record<string, unknown>;
-    const isWrapped = typeof parsedBody.project === "string" && "request" in parsedBody;
+    const parsedBody: unknown = JSON.parse(body);
+    if (!isRecord(parsedBody)) {
+      return { userPromptId: fallbackId };
+    }
 
+    const isWrapped = typeof parsedBody.project === "string" && isRecord(parsedBody.request);
     if (isWrapped) {
-      const wrappedBody = {
+      const requestPayload = { ...(parsedBody.request as Record<string, unknown>) };
+      sanitizeRequestPayload(
+        requestPayload,
+        effectiveModel,
+        requestedModel,
+        thinkingConfigDefaults,
+      );
+      const wrappedBody: Record<string, unknown> = {
         ...parsedBody,
         model: effectiveModel,
-      } as Record<string, unknown>;
+        request: requestPayload,
+      };
       const { userPromptId } = normalizeWrappedIdentifiers(wrappedBody);
       return { body: JSON.stringify(wrappedBody), userPromptId };
     }
 
     const requestPayload = { ...parsedBody };
-    transformOpenAIToolCalls(requestPayload);
-    addThoughtSignaturesToFunctionCalls(requestPayload);
-    normalizeThinking(
+    sanitizeRequestPayload(
       requestPayload,
-      resolveDefaultThinkingConfig(thinkingConfigDefaults, requestedModel, effectiveModel),
-      thinkingConfigDefaults?.provider,
+      effectiveModel,
+      requestedModel,
+      thinkingConfigDefaults,
     );
-    normalizeSystemInstruction(requestPayload);
-    normalizeCachedContent(requestPayload);
-    stripThoughtPartsFromHistory(requestPayload);
-
-    if ("model" in requestPayload) {
-      delete requestPayload.model;
-    }
 
     const { userPromptId } = normalizeRequestPayloadIdentifiers(requestPayload);
     const wrappedBody = {
@@ -167,18 +216,31 @@ function normalizeThinking(
   requestPayload: Record<string, unknown>,
   modelThinkingConfig: unknown,
   providerThinkingConfig: unknown,
+  thinkingMode?: GeminiThinkingMode,
 ): void {
-  const rawGenerationConfig = requestPayload.generationConfig as Record<string, unknown> | undefined;
+  const rawGenerationConfig = isRecord(requestPayload.generationConfig)
+    ? { ...requestPayload.generationConfig }
+    : undefined;
   const hasRootThinkingConfig = Object.prototype.hasOwnProperty.call(requestPayload, "thinkingConfig");
   const hasRequestThinkingConfig =
     hasRootThinkingConfig ||
     (!!rawGenerationConfig && Object.prototype.hasOwnProperty.call(rawGenerationConfig, "thinkingConfig"));
+
+  const mergedDefaultThinking =
+    isRecord(providerThinkingConfig) && isRecord(modelThinkingConfig)
+      ? { ...providerThinkingConfig, ...modelThinkingConfig }
+      : modelThinkingConfig ?? providerThinkingConfig;
+
   const sourceThinkingConfig = hasRootThinkingConfig
     ? requestPayload.thinkingConfig
     : hasRequestThinkingConfig
-    ? rawGenerationConfig?.thinkingConfig
-    : modelThinkingConfig ?? providerThinkingConfig;
-  const normalizedThinking = normalizeThinkingConfig(sourceThinkingConfig);
+      ? rawGenerationConfig?.thinkingConfig
+      : mergedDefaultThinking;
+
+  const normalizedThinking = normalizeThinkingConfig(
+    sourceThinkingConfig,
+    thinkingMode ? { thinkingMode } : undefined,
+  );
   if (hasRootThinkingConfig) {
     delete requestPayload.thinkingConfig;
   }
@@ -206,15 +268,14 @@ function normalizeSystemInstruction(requestPayload: Record<string, unknown>): vo
 }
 
 function normalizeCachedContent(requestPayload: Record<string, unknown>): void {
-  const extraBody =
-    requestPayload.extra_body && typeof requestPayload.extra_body === "object"
-      ? (requestPayload.extra_body as Record<string, unknown>)
-      : undefined;
+  const extraBody = isRecord(requestPayload.extra_body)
+    ? { ...requestPayload.extra_body }
+    : undefined;
   const cachedContentFromExtra = extraBody?.cached_content ?? extraBody?.cachedContent;
   const cachedContent =
-    (requestPayload.cached_content as string | undefined) ??
-    (requestPayload.cachedContent as string | undefined) ??
-    (cachedContentFromExtra as string | undefined);
+    readString(requestPayload.cached_content) ??
+    readString(requestPayload.cachedContent) ??
+    readString(cachedContentFromExtra);
 
   if (cachedContent) {
     requestPayload.cachedContent = cachedContent;
@@ -229,6 +290,8 @@ function normalizeCachedContent(requestPayload: Record<string, unknown>): void {
   delete extraBody.cachedContent;
   if (Object.keys(extraBody).length === 0) {
     delete requestPayload.extra_body;
+  } else {
+    requestPayload.extra_body = extraBody;
   }
 }
 
@@ -240,33 +303,51 @@ function stripThoughtPartsFromHistory(requestPayload: Record<string, unknown>): 
 
   const sanitizedContents: unknown[] = [];
   for (const content of contents) {
-    if (!content || typeof content !== "object") {
+    if (!isRecord(content)) {
       sanitizedContents.push(content);
       continue;
     }
 
-    const record = content as Record<string, unknown>;
-    const parts = Array.isArray(record.parts) ? record.parts : undefined;
+    const parts = Array.isArray(content.parts) ? content.parts : undefined;
     if (!parts) {
       sanitizedContents.push(content);
       continue;
     }
 
-    const filteredParts = parts.filter((part) => {
-      if (!part || typeof part !== "object") {
-        return true;
+    let rescuedSignature: string | undefined;
+    const keptParts: unknown[] = [];
+    for (const part of parts) {
+      if (isRecord(part) && part.thought === true) {
+        if (!rescuedSignature) {
+          rescuedSignature = readString(part.thoughtSignature);
+        }
+        continue;
       }
-      return (part as Record<string, unknown>).thought !== true;
-    });
+      keptParts.push(isRecord(part) ? { ...part } : part);
+    }
 
     // Drop empty model turns produced by interrupted thought streaming.
-    if (filteredParts.length === 0 && record.role === "model") {
+    if (keptParts.length === 0 && content.role === "model") {
       continue;
     }
 
+    if (rescuedSignature && content.role === "model") {
+      const hasExistingSignature = keptParts.some(
+        (part) => isRecord(part) && Boolean(readString(part.thoughtSignature)),
+      );
+      if (!hasExistingSignature) {
+        const targetPart =
+          keptParts.find((part) => isRecord(part) && isRecord(part.functionCall)) ??
+          keptParts.find((part) => isRecord(part));
+        if (isRecord(targetPart)) {
+          targetPart.thoughtSignature = rescuedSignature;
+        }
+      }
+    }
+
     sanitizedContents.push({
-      ...record,
-      parts: filteredParts,
+      ...content,
+      parts: keptParts,
     });
   }
 

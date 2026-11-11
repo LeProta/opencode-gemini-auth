@@ -1,6 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { formatGeminiQuotaOutput, formatRelativeResetTime } from "./quota";
+import {
+  formatGeminiQuotaOutput,
+  formatRelativeResetTime,
+  retrieveGeminiQuotaReport,
+} from "./quota";
 import type { RetrieveUserQuotaBucket } from "./project/types";
+import type { OAuthAuthDetails } from "./types";
 
 const REAL_DATE_NOW = Date.now;
 const FIXED_NOW = Date.parse("2026-02-21T00:00:00.000Z");
@@ -117,5 +122,105 @@ describe("formatGeminiQuotaOutput", () => {
     expect(output).toContain("REQUESTS");
     expect(output).toContain("TOKENS");
     expect(output).toContain("  ↳ vertex");
+  });
+});
+
+describe("retrieveGeminiQuotaReport", () => {
+  const sampleAuth: OAuthAuthDetails = {
+    type: "oauth",
+    refresh: "refresh-token",
+    access: "access-token",
+    expires: FIXED_NOW + 60_000,
+  };
+
+  it("reports uninitialized, non-oauth, error, and thrown resolver states cleanly", async () => {
+    const uninitialized = await retrieveGeminiQuotaReport({
+      resolveAuth: async () => ({ status: "uninitialized" }),
+      ensureProjectContext: async () => {
+        throw new Error("should not run");
+      },
+      getConfiguredProjectId: () => undefined,
+    });
+    expect(uninitialized.ok).toBe(false);
+    expect(uninitialized.text).toContain("before Google auth is initialized");
+
+    const notOauth = await retrieveGeminiQuotaReport({
+      resolveAuth: async () => ({ status: "not_oauth" }),
+      ensureProjectContext: async () => {
+        throw new Error("should not run");
+      },
+      getConfiguredProjectId: () => undefined,
+    });
+    expect(notOauth.ok).toBe(false);
+    expect(notOauth.text).toContain("requires OAuth with Google");
+
+    const authError = await retrieveGeminiQuotaReport({
+      resolveAuth: async () => ({ status: "error", message: "token expired" }),
+      ensureProjectContext: async () => {
+        throw new Error("should not run");
+      },
+      getConfiguredProjectId: () => undefined,
+    });
+    expect(authError).toEqual({ ok: false, text: "token expired" });
+
+    const thrown = await retrieveGeminiQuotaReport({
+      resolveAuth: async () => {
+        throw new Error("network down");
+      },
+      ensureProjectContext: async () => {
+        throw new Error("should not run");
+      },
+      getConfiguredProjectId: () => undefined,
+    });
+    expect(thrown).toEqual({ ok: false, text: "Gemini quota lookup failed: network down" });
+  });
+
+  it("formats quota buckets without relying on global auth state", async () => {
+    const origNow = Date.now;
+    Date.now = () => FIXED_NOW;
+    try {
+      let seenProjectArg: string | undefined;
+      let seenModelArg: string | undefined;
+      const report = await retrieveGeminiQuotaReport({
+        resolveAuth: async () => ({ status: "ok", auth: sampleAuth }),
+        getConfiguredProjectId: async () => "configured-proj",
+        getUserAgentModel: () => "gemini-2.5-pro",
+        ensureProjectContext: async (auth, configuredProjectId, userAgentModel) => {
+          seenProjectArg = configuredProjectId;
+          seenModelArg = userAgentModel;
+          return { auth, effectiveProjectId: "effective-proj" };
+        },
+        fetchUserQuota: async () => ({
+          buckets: [
+            {
+              modelId: "gemini-2.5-pro",
+              tokenType: "REQUESTS",
+              remainingFraction: 0.75,
+              remainingAmount: "150",
+            },
+          ],
+        }),
+      });
+
+      expect(seenProjectArg).toBe("configured-proj");
+      expect(seenModelArg).toBe("gemini-2.5-pro");
+      expect(report.ok).toBe(true);
+      expect(report.projectId).toBe("effective-proj");
+      expect(report.buckets).toHaveLength(1);
+      expect(report.text).toContain("Gemini quota usage for project `effective-proj`");
+      expect(report.text).toContain("75.0% (150 left)");
+
+      const empty = await retrieveGeminiQuotaReport({
+        resolveAuth: async () => ({ status: "ok", auth: sampleAuth }),
+        getConfiguredProjectId: () => undefined,
+        ensureProjectContext: async (auth) => ({ auth, effectiveProjectId: "effective-proj" }),
+        fetchUserQuota: async () => ({ buckets: [] }),
+      });
+      expect(empty.ok).toBe(false);
+      expect(empty.projectId).toBe("effective-proj");
+      expect(empty.text).toContain("No Gemini quota buckets were returned");
+    } finally {
+      Date.now = origNow;
+    }
   });
 });
