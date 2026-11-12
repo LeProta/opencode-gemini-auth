@@ -1,6 +1,7 @@
 import { Integration, type Credential, type Plugin } from "@opencode/plugin";
 
 import type { GeminiTokenExchangeResult } from "../gemini/oauth";
+import { logGeminiDebugMessage, startGeminiDebugRequest, type GeminiDebugContext } from "../plugin/debug";
 import { accessTokenExpired, formatRefreshParts, parseRefreshParts } from "../plugin/auth";
 import { isGenerativeLanguageRequest, prepareGeminiRequest, transformGeminiResponse } from "../plugin/request";
 import { geminiFetch } from "../fetch";
@@ -17,9 +18,12 @@ import {
   toAntigravityRequest,
 } from "./client";
 import { authorizeAntigravity } from "./plugin";
+import { groupModelsByEffort, resolveUpstreamModelId } from "./vendor/protocol.js";
 
 const METHOD_ID = Integration.MethodID.make("antigravity");
 const MARKER = "opencode.provider.google-antigravity";
+/** Set by a model variant; the request hook maps (model, effort) back to the upstream id. */
+const EFFORT_HEADER = "x-antigravity-effort";
 
 type V2Context = Pick<Plugin.Context, "provider" | "integration" | "session">;
 
@@ -30,6 +34,7 @@ interface Snapshot {
   init: RequestInit;
   auth: OAuthAuthDetails;
   replayed: boolean;
+  debugContext: GeminiDebugContext | null;
 }
 
 function toCredential(result: GeminiTokenExchangeResult): Credential.OAuth {
@@ -111,23 +116,24 @@ export async function setupAntigravityV2(ctx: V2Context): Promise<Plugin.Cleanup
         integrationID: ANTIGRAVITY_PROVIDER_ID,
         name: "Google (Antigravity)",
       } as unknown as typeof template.provider,
-      models: ids.map((id) => {
-        const caps = cache.modelCaps?.[id];
+      // `gemini-3.8-flash-{low,medium,high}` becomes one model with low/medium/high variants.
+      models: groupModelsByEffort(ids, (cache.modelCaps ?? null) as any).map((group: any) => {
+        const efforts = Object.keys(group.reasoningEfforts ?? {});
         return {
           ...base,
-          id,
-          modelID: id,
+          id: group.id,
+          modelID: group.id,
           providerID: ANTIGRAVITY_PROVIDER_ID,
           canonical: undefined,
           family: undefined,
-          name: id,
-          variants: [],
+          name: group.id,
+          variants: efforts.map((effort) => ({ id: effort, headers: { [EFFORT_HEADER]: effort } })),
           cost: [], // subscription quota, not per-token billing
           status: "active",
           enabled: true,
           limit: {
-            context: caps?.contextLength ?? base.limit.context,
-            output: caps?.maxCompletionTokens ?? base.limit.output,
+            context: group.contextWindow ?? base.limit.context,
+            output: group.maxTokens ?? base.limit.output,
           },
         } as unknown as typeof base;
       }),
@@ -170,13 +176,34 @@ export async function setupAntigravityV2(ctx: V2Context): Promise<Plugin.Cleanup
 
       const original = event.request;
       const body = original.method === "GET" || original.method === "HEAD" ? undefined : await original.clone().text();
+      const headers = new Headers(original.headers);
+      const effort = headers.get(EFFORT_HEADER) ?? undefined;
+      headers.delete(EFFORT_HEADER);
+      const url = original.url.replace(
+        /\/models\/([^:]+):/,
+        (_match, model: string) => `/models/${resolveUpstreamModelId(model, effort, ids)}:`,
+      );
       const prepared = prepareGeminiRequest(
-        original,
-        { method: original.method, headers: original.headers, body, signal: original.signal },
+        url,
+        { method: original.method, headers, body, signal: original.signal },
         auth.access!,
         projectId,
       );
       const target = toAntigravityRequest(String(prepared.request), prepared.init, projectId, await currentVersion());
+      const debugContext = startGeminiDebugRequest({
+        originalUrl: original.url,
+        resolvedUrl: target.url,
+        method: target.init.method,
+        headers: target.init.headers,
+        body: target.init.body,
+        streaming: prepared.streaming,
+        projectId,
+      });
+      if (debugContext && typeof target.init.body === "string") {
+        const sent = JSON.parse(target.init.body);
+        logGeminiDebugMessage(`Antigravity ${sent.model} generationConfig: ${JSON.stringify(sent.request?.generationConfig ?? null)}`);
+        logGeminiDebugMessage(`Original generationConfig: ${JSON.stringify(body ? JSON.parse(body).generationConfig ?? null : null)}`);
+      }
       const request = new Request(target.url, target.init);
       requests.set(request, {
         streaming: prepared.streaming,
@@ -185,6 +212,7 @@ export async function setupAntigravityV2(ctx: V2Context): Promise<Plugin.Cleanup
         init: target.init,
         auth,
         replayed: false,
+        debugContext,
       });
       event.request = request;
     },
@@ -207,7 +235,15 @@ export async function setupAntigravityV2(ctx: V2Context): Promise<Plugin.Cleanup
         headers.set("Authorization", `Bearer ${next.access}`);
         event.response = await geminiFetch(snapshot.url, { ...snapshot.init, headers });
       }
-      event.response = await transformGeminiResponse(event.response, snapshot.streaming, null, snapshot.requestedModel);
+      if (snapshot.debugContext) {
+        // Debug only: tee the raw upstream stream into the log (thought parts included).
+        void event.response
+          .clone()
+          .text()
+          .then((raw) => logGeminiDebugMessage(`Antigravity raw response: ${raw.slice(0, 4000)}`))
+          .catch(() => {});
+      }
+      event.response = await transformGeminiResponse(event.response, snapshot.streaming, snapshot.debugContext, snapshot.requestedModel);
     },
     { providerID: ANTIGRAVITY_PROVIDER_ID },
   );

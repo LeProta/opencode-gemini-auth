@@ -40,7 +40,8 @@ describe("toAntigravityRequest", () => {
     expect(envelope.request.safetySettings).toBeUndefined();
     expect(envelope.request.session_id).toBeUndefined();
     // CLIProxyAPI drops maxOutputTokens for every non-Claude model
-    expect(envelope.request.generationConfig).toEqual({ temperature: 0.5 });
+    // and the reasoning text is requested so OpenCode can show it
+    expect(envelope.request.generationConfig).toEqual({ temperature: 0.5, thinkingConfig: { includeThoughts: true, thinkingLevel: "high" } });
     expect(envelope.request.contents[0].parts[0].text).toBe("hello");
   });
 
@@ -58,5 +59,25 @@ describe("isPublishableModelId", () => {
     expect(isPublishableModelId("gemini-3.1-pro-high")).toBe(true);
     expect(isPublishableModelId("chat_20706")).toBe(false);
     expect(isPublishableModelId("tab_flash_lite_preview")).toBe(false);
+  });
+});
+
+describe("withThoughts", () => {
+  const { withThoughts } = require("./client") as typeof import("./client");
+  const tc = (model: string, request: Record<string, any> = {}) => withThoughts(model, request).generationConfig?.thinkingConfig;
+
+  it("pairs includeThoughts with a level or budget, like CLIProxyAPI", () => {
+    expect(tc("gemini-3.8-flash-low")).toEqual({ includeThoughts: true, thinkingLevel: "low" });
+    expect(tc("gemini-3-flash")).toEqual({ includeThoughts: true, thinkingLevel: "high" });
+    expect(tc("gemini-2.5-flash-thinking")).toEqual({ includeThoughts: true, thinkingBudget: -1 });
+    expect(tc("claude-opus-4-6-thinking")).toEqual({ includeThoughts: true, thinkingBudget: 8192 });
+  });
+
+  it("leaves non-thinking Claude, image models and explicit opt-outs alone", () => {
+    expect(tc("claude-sonnet-4-6")).toBeUndefined();
+    expect(tc("gemini-3.1-flash-image")).toBeUndefined();
+    expect(tc("gemini-3-flash", { generationConfig: { thinkingConfig: { includeThoughts: false } } })).toEqual({
+      includeThoughts: false,
+    });
   });
 });

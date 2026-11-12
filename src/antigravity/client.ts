@@ -22,6 +22,7 @@ import {
   VERSION,
   parseAvailableModels,
   parseVersionManifest,
+  splitEffortModelId,
   tokenExchangeForm,
   tokenRefreshForm,
 } from "./vendor/protocol.js";
@@ -289,6 +290,28 @@ export async function refreshModels(accessToken: string, project: string): Promi
 // ---------------------------------------------------------------------------
 
 /**
+ * Asks upstream to stream the reasoning text (`thought: true` parts, which OpenCode
+ * shows as reasoning). Upstream ignores `includeThoughts` on its own: like CLIProxyAPI,
+ * pair it with a level (Gemini 3, from the `-low/-medium/-high` id suffix) or a budget.
+ */
+export function withThoughts(model: string, request: Record<string, any>): Record<string, any> {
+  if (model.includes("image")) return request;
+  const generationConfig = request.generationConfig ?? {};
+  const current = generationConfig.thinkingConfig ?? {};
+  if (current.includeThoughts === false) return request;
+  const thinkingConfig: Record<string, unknown> = { ...current, includeThoughts: true };
+  if (current.thinkingLevel === undefined && current.thinkingBudget === undefined) {
+    const effort = splitEffortModelId(model)?.effort;
+    if (/gemini-3/.test(model)) thinkingConfig.thinkingLevel = effort === "medium" || effort === "low" ? effort : "high";
+    else if (/claude/.test(model)) {
+      if (!/thinking/.test(model)) return request; // non-thinking Claude rejects a budget
+      thinkingConfig.thinkingBudget = 8192;
+    } else thinkingConfig.thinkingBudget = -1; // dynamic (Gemini 2.5)
+  }
+  return { ...request, generationConfig: { ...generationConfig, thinkingConfig } };
+}
+
+/**
  * Takes the output of `prepareGeminiRequest` (already sanitized for Code Assist)
  * and re-targets it at the Antigravity surface.
  */
@@ -308,7 +331,7 @@ export function toAntigravityRequest(
     const wrapped = JSON.parse(body) as { model: string; request?: Record<string, unknown> };
     // Drop the Gemini CLI per-process session_id; the envelope derives one per conversation.
     const { session_id: _ignored, ...request } = wrapped.request ?? {};
-    body = JSON.stringify(antigravityEnvelope(wrapped.model, project, request));
+    body = JSON.stringify(antigravityEnvelope(wrapped.model, project, withThoughts(wrapped.model, request)));
   }
 
   return {
