@@ -49,11 +49,3 @@ describe("registration", () => {
   });
 });
 
-describe("prettyModelName", () => {
-  const { prettyModelName } = require("./plugin-v2") as typeof import("./plugin-v2");
-  it("names ids the built-in catalog lacks", () => {
-    expect(prettyModelName("claude-opus-4-6-thinking")).toBe("Claude Opus 4.6 Thinking");
-    expect(prettyModelName("gemini-3-flash")).toBe("Gemini 3 Flash");
-    expect(prettyModelName("gpt-oss-120b-medium")).toBe("GPT Oss 120b Medium");
-  });
-});

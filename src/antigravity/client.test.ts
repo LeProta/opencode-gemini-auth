@@ -70,13 +70,9 @@ describe("withThoughts", () => {
     expect(tc("gemini-3.8-flash-low")).toEqual({ includeThoughts: true, thinkingLevel: "low" });
     expect(tc("gemini-3-flash")).toEqual({ includeThoughts: true, thinkingLevel: "high" });
     expect(tc("gemini-2.5-flash-thinking")).toEqual({ includeThoughts: true, thinkingBudget: -1 });
-    expect(tc("claude-opus-4-6-thinking")).toEqual({ includeThoughts: true, thinkingBudget: 8192 });
-    expect(withThoughts("claude-opus-4-6-thinking", {}, "high").generationConfig.thinkingConfig.thinkingBudget).toBe(24576);
-    expect(withThoughts("claude-opus-4-6-thinking", {}, "low").generationConfig.thinkingConfig.thinkingBudget).toBe(1024);
   });
 
-  it("leaves non-thinking Claude, image models and explicit opt-outs alone", () => {
-    expect(tc("claude-sonnet-4-6")).toBeUndefined();
+  it("leaves image models and explicit opt-outs alone", () => {
     expect(tc("gemini-3.1-flash-image")).toBeUndefined();
     expect(tc("gemini-3-flash", { generationConfig: { thinkingConfig: { includeThoughts: false } } })).toEqual({
       includeThoughts: false,

@@ -1,6 +1,6 @@
 import { describe, expect, it, mock } from "bun:test";
-import type { GeminiAuthorization, GeminiTokenExchangeResult } from "../gemini/oauth";
-import { createOAuthAuthorizeMethod } from "./oauth-authorize";
+import { createOAuthAuthorizeMethod, type OAuthAuthorization } from "./oauth-authorize";
+import type { TokenExchangeResult } from "./types";
 import {
   createOAuthCallbackRequestHandler,
   startOAuthListener,
@@ -91,7 +91,7 @@ function createInProcessListenerHarness() {
 }
 
 describe("oauth-authorize and localhost callback server", () => {
-  const sampleAuth: GeminiAuthorization = {
+  const sampleAuth: OAuthAuthorization = {
     url: "https://accounts.google.com/o/oauth2/v2/auth?state=expected-state",
     verifier: "pkce-verifier",
     state: "expected-state",
@@ -120,7 +120,7 @@ describe("oauth-authorize and localhost callback server", () => {
       isHeadless: () => false,
       openBrowser,
       authorizeFn: async () => sampleAuth,
-      exchangeFn: async (code): Promise<GeminiTokenExchangeResult> => {
+      exchangeFn: async (code): Promise<TokenExchangeResult> => {
         exchangeCalls.push(code);
         if (code === "bad-code") {
           return { type: "failed", error: "invalid_grant: malformed auth code" };
@@ -132,17 +132,13 @@ describe("oauth-authorize and localhost callback server", () => {
           expires: Date.now() + 3600_000,
         };
       },
-      resolveProjectContextFn: async (auth, _access, configuredProjectId) => ({
-        auth: {
-          ...auth,
-          refresh: `refresh-1|${configuredProjectId ?? "default-proj"}`,
-        },
-        effectiveProjectId: configuredProjectId ?? "default-proj",
+      resolveProjectContextFn: async (auth) => ({
+        auth: { ...auth, refresh: "refresh-1|resolved-proj" },
       }),
       startListenerFn: harness.startListenerFn,
     });
 
-    const method = await authorize({ projectId: "user-selected-proj" });
+    const method = await authorize();
     expect(method.method).toBe("auto");
     expect(openBrowser.mock.calls.length).toBe(1);
     if (method.method !== "auto") {
@@ -158,24 +154,24 @@ describe("oauth-authorize and localhost callback server", () => {
       "/oauth2callback?code=any-code&state=wrong-state",
     );
     expect(mismatchResp.statusCode).toBe(400);
-    expect(mismatchResp.body).not.toContain("You're connected to Opencode");
+    expect(mismatchResp.body).not.toContain("You're connected to OpenCode");
 
     const malformedResp = await harness.dispatchRequest(
       "/oauth2callback?code=bad-code&state=expected-state",
     );
     expect(malformedResp.statusCode).toBe(400);
-    expect(malformedResp.body).not.toContain("You're connected to Opencode");
+    expect(malformedResp.body).not.toContain("You're connected to OpenCode");
 
     const okResp = await harness.dispatchRequest(
       "/oauth2callback?code=good-code&state=expected-state",
     );
     expect(okResp.statusCode).toBe(200);
-    expect(okResp.body).toContain("You're connected to Opencode");
+    expect(okResp.body).toContain("You're connected to OpenCode");
 
     const outcome = await resultPromise;
     expect(outcome).toEqual({
       type: "success",
-      refresh: "refresh-1|user-selected-proj",
+      refresh: "refresh-1|resolved-proj",
       access: "access-1",
       expires: expect.any(Number),
     });
@@ -209,7 +205,7 @@ describe("oauth-authorize and localhost callback server", () => {
     expect(failResp.statusCode).toBe(502);
     expect(failResp.body).toContain("Authentication failed");
     expect(failResp.body).toContain("bad &lt;client&gt; configuration");
-    expect(failResp.body).not.toContain("You're connected to Opencode");
+    expect(failResp.body).not.toContain("You're connected to OpenCode");
 
     const outcome = await resultPromise;
     expect(outcome).toEqual({

@@ -80,7 +80,7 @@ function renderFailureResponse(message?: string): string {
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <title>Opencode Gemini OAuth Failed</title>
+    <title>OpenCode Google sign-in failed</title>
     <style>
       :root { color-scheme: light dark; }
       body {
@@ -136,7 +136,7 @@ export interface OAuthCallbackRequestHandlerDeps {
 export function createOAuthCallbackRequestHandler(
   deps: OAuthCallbackRequestHandlerDeps,
 ): (request: Pick<IncomingMessage, "url">, response: Pick<ServerResponse, "writeHead" | "end">) => void {
-  const successHtml = deps.successResponse ?? "<!DOCTYPE html><html><body>You're connected to Opencode</body></html>";
+  const successHtml = deps.successResponse ?? "<!DOCTYPE html><html><body>You're connected to OpenCode</body></html>";
 
   return (request, response) => {
     const finishResponse = (
@@ -235,7 +235,7 @@ const successResponse = `<!DOCTYPE html>
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <title>Opencode Gemini OAuth</title>
+    <title>OpenCode Google sign-in</title>
     <style>
       :root { color-scheme: light dark; }
       body {
@@ -341,16 +341,16 @@ const successResponse = `<!DOCTYPE html>
       <header>
         <span class="logo" aria-hidden="true">
           <svg viewBox="0 0 46 46" xmlns="http://www.w3.org/2000/svg" role="img">
-            <title>Gemini linked to Opencode</title>
+            <title>Google linked to OpenCode</title>
             <path fill="#4285F4" d="M43.6 23.5c0-1.5-.1-3-.4-4.4H23v8.3h11.6c-.5 2.8-2 5.1-4.2 6.7v5.5h6.8c4-3.7 6.4-9.1 6.4-16.1z"/>
             <path fill="#34A853" d="M23 45c5.8 0 10.6-1.9 14.1-5.2l-6.8-5.5c-1.9 1.3-4.3 2-7.3 2-5.6 0-10.4-3.7-12.1-8.7H3.8v5.6C7.3 39.9 14.6 45 23 45z"/>
             <path fill="#FBBC04" d="M10.9 28.6c-.5-1.3-.8-2.7-.8-4.1 0-1.5.3-2.8.8-4.1v-5.6H3.8C2.3 17.7 1.5 20.2 1.5 24s.8 6.3 2.3 9.2l6.9-5.6z"/>
             <path fill="#EA4335" d="M23 9.5c3.2 0 6 .9 8.3 2.7l6.2-6.2C33.6 2.2 28.8 0 23 0 14.6 0 7.3 5.1 3.8 12.4l7.1 5.6c1.7-5 6.5-8.5 12.1-8.5z"/>
           </svg>
         </span>
-        <span class="brand">Gemini linked to Opencode</span>
+        <span class="brand">Google linked to OpenCode</span>
       </header>
-      <h1>You're connected to Opencode</h1>
+      <h1>You're connected to OpenCode</h1>
       <p>Your Google account is now linked to Opencode. You can close this window and continue in the CLI.</p>
       <a class="action" href="javascript:window.close()">Close window</a>
       <p class="note">Need to reconnect later? Re-run the authentication command in Opencode.</p>

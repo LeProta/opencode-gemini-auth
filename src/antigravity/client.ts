@@ -11,10 +11,9 @@ import { join } from "node:path";
 
 import { GEMINI_CODE_ASSIST_ENDPOINT } from "../constants";
 import { geminiFetch } from "../fetch";
-import type { GeminiTokenExchangeResult } from "../gemini/oauth";
 import { formatRefreshParts, parseRefreshParts } from "../plugin/auth";
 import { getGeminiPluginDataDir } from "../plugin/storage-paths";
-import type { OAuthAuthDetails } from "../plugin/types";
+import type { OAuthAuthDetails, TokenExchangeResult } from "../plugin/types";
 import { CLIPROXY_UPSTREAM } from "./upstream";
 import {
   API,
@@ -28,11 +27,6 @@ import {
   tokenRefreshForm,
 } from "./vendor/protocol.js";
 import { FALLBACK_VERSION, GOOG_API_CLIENT, antigravityEnvelope, defaultTierId, onboardBody, userAgents } from "./wire";
-
-export const ANTIGRAVITY_PROVIDER_ID = "google-antigravity";
-
-/** Placeholder list until fetchAvailableModels succeeds (seen on a Google AI Pro account, 2026-11). */
-export const DEFAULT_MODELS = ["gemini-3-flash", "gemini-3.8-flash-high", "gemini-2.5-pro", "claude-sonnet-4-6"];
 
 const VERSION_TTL_MS = 6 * 60 * 60 * 1000;
 const VERSION_MEMO_MS = 10 * 60 * 1000;
@@ -188,7 +182,7 @@ function extractProject(data: unknown): string {
 // ---------------------------------------------------------------------------
 
 /** Matches `exchangeGeminiWithVerifier`'s shape; Antigravity's client uses no PKCE. */
-export async function exchangeCode(code: string): Promise<GeminiTokenExchangeResult> {
+export async function exchangeCode(code: string): Promise<TokenExchangeResult> {
   try {
     const ua = userAgents(await currentVersion());
     const res = await geminiFetch(OAUTH.tokenEndpoint, {
@@ -380,23 +374,17 @@ function formatDuration(ms: number): string {
  * shows as reasoning). Upstream ignores `includeThoughts` on its own: like CLIProxyAPI,
  * pair it with a level (Gemini 3, from the `-low/-medium/-high` id suffix) or a budget.
  */
-/** CLIProxyAPI's level -> budget map (internal/thinking/convert.go). */
-const CLAUDE_BUDGETS: Record<string, number> = { low: 1024, medium: 8192, high: 24576 };
-
-export function withThoughts(model: string, request: Record<string, any>, effort?: string): Record<string, any> {
+export function withThoughts(model: string, request: Record<string, any>): Record<string, any> {
   if (model.includes("image")) return request;
   const generationConfig = request.generationConfig ?? {};
   const current = generationConfig.thinkingConfig ?? {};
   if (current.includeThoughts === false) return request;
   const thinkingConfig: Record<string, unknown> = { ...current, includeThoughts: true };
   if (current.thinkingLevel === undefined && current.thinkingBudget === undefined) {
-    // Gemini ids carry their effort (`-low`); Claude `*-thinking` gets it from the variant.
+    // The upstream id carries the effort (`gemini-3.8-flash-low`).
     const idEffort = splitEffortModelId(model)?.effort;
     if (/gemini-3/.test(model)) thinkingConfig.thinkingLevel = idEffort === "medium" || idEffort === "low" ? idEffort : "high";
-    else if (/claude/.test(model)) {
-      if (!/thinking/.test(model)) return request; // non-thinking Claude rejects a budget
-      thinkingConfig.thinkingBudget = CLAUDE_BUDGETS[effort ?? ""] ?? CLAUDE_BUDGETS.medium;
-    } else thinkingConfig.thinkingBudget = -1; // dynamic (Gemini 2.5)
+    else thinkingConfig.thinkingBudget = -1; // dynamic (Gemini 2.5)
   }
   return { ...request, generationConfig: { ...generationConfig, thinkingConfig } };
 }
@@ -410,7 +398,6 @@ export function toAntigravityRequest(
   init: RequestInit,
   project: string,
   version: string,
-  effort?: string,
 ): { url: string; init: RequestInit } {
   const headers = new Headers(init.headers);
   headers.set("User-Agent", userAgents(version).short);
@@ -422,7 +409,7 @@ export function toAntigravityRequest(
     const wrapped = JSON.parse(body) as { model: string; request?: Record<string, unknown> };
     // Drop the Gemini CLI per-process session_id; the envelope derives one per conversation.
     const { session_id: _ignored, ...request } = wrapped.request ?? {};
-    body = JSON.stringify(antigravityEnvelope(wrapped.model, project, withThoughts(wrapped.model, request, effort)));
+    body = JSON.stringify(antigravityEnvelope(wrapped.model, project, withThoughts(wrapped.model, request)));
   }
 
   return {

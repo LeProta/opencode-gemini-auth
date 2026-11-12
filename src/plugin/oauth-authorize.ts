@@ -1,75 +1,54 @@
 import { spawn } from "node:child_process";
 
-import { authorizeGemini, exchangeGeminiWithVerifier } from "../gemini/oauth";
-import type { GeminiTokenExchangeResult } from "../gemini/oauth";
 import { isGeminiDebugEnabled, logGeminiDebugMessage } from "./debug";
-import { resolveProjectContextFromAccessToken } from "./project";
-import { resolveConfiguredProjectId } from "./provider";
 import {
   startOAuthListener,
   type OAuthCallbackResponse,
   type OAuthListener,
 } from "./server";
-import type { OAuthAuthDetails } from "./types";
+import type { OAuthAuthDetails, TokenExchangeResult } from "./types";
 
-export interface OAuthAuthorizeInputs {
-  projectId?: unknown;
-  [key: string]: unknown;
+export interface OAuthAuthorization {
+  url: string;
+  /** PKCE verifier handed back to `exchangeFn`; empty when the client uses none. */
+  verifier: string;
+  state: string;
 }
 
 export interface OAuthAuthorizeMethodOptions {
-  getConfiguredProjectId?: () => Promise<string | undefined> | string | undefined;
-  getUserAgentModel?: () => Promise<string | undefined> | string | undefined;
+  authorizeFn: () => Promise<OAuthAuthorization>;
+  exchangeFn: (code: string, verifier: string) => Promise<TokenExchangeResult>;
+  /** Runs once tokens are in hand (e.g. registration); may rewrite the stored refresh string. */
+  resolveProjectContextFn?: (auth: OAuthAuthDetails, accessToken: string) => Promise<{ auth: OAuthAuthDetails }>;
   timeoutMs?: number;
   redirectUri?: string;
   isHeadless?: () => boolean;
   openBrowser?: (url: string) => void;
-  authorizeFn?: typeof authorizeGemini;
-  exchangeFn?: typeof exchangeGeminiWithVerifier;
-  resolveProjectContextFn?: typeof resolveProjectContextFromAccessToken;
   startListenerFn?: typeof startOAuthListener;
 }
 
 /**
- * Builds the OAuth authorize callback used by plugin auth methods.
+ * Builds the OAuth authorize callback: local callback listener when possible,
+ * pasted redirect URL or code otherwise.
  */
-export function createOAuthAuthorizeMethod(options?: OAuthAuthorizeMethodOptions): (
-  inputs?: OAuthAuthorizeInputs,
-) => Promise<
+export function createOAuthAuthorizeMethod(options: OAuthAuthorizeMethodOptions): () => Promise<
   {
     url: string;
     instructions: string;
   } & (
-    | { method: "auto"; callback: () => Promise<GeminiTokenExchangeResult> }
-    | { method: "code"; callback: (callbackUrl: string) => Promise<GeminiTokenExchangeResult> }
+    | { method: "auto"; callback: () => Promise<TokenExchangeResult> }
+    | { method: "code"; callback: (callbackUrl: string) => Promise<TokenExchangeResult> }
   )
 > {
-  const authorizeFn = options?.authorizeFn ?? authorizeGemini;
-  const exchangeFn = options?.exchangeFn ?? exchangeGeminiWithVerifier;
-  const resolveProjectContextFn =
-    options?.resolveProjectContextFn ?? resolveProjectContextFromAccessToken;
-  const startListenerFn = options?.startListenerFn ?? startOAuthListener;
-  const openBrowser = options?.openBrowser ?? openBrowserUrl;
+  const { authorizeFn, exchangeFn, resolveProjectContextFn } = options;
+  const startListenerFn = options.startListenerFn ?? startOAuthListener;
+  const openBrowser = options.openBrowser ?? openBrowserUrl;
 
-  return async (inputs?: OAuthAuthorizeInputs) => {
-    const inputProjectId =
-      typeof inputs?.projectId === "string" && inputs.projectId.trim()
-        ? inputs.projectId.trim()
-        : undefined;
-
-    const maybeHydrateProjectId = async (
-      result: GeminiTokenExchangeResult,
-    ): Promise<GeminiTokenExchangeResult> => {
-      if (result.type !== "success" || !result.access) {
+  return async () => {
+    const maybeHydrateProjectId = async (result: TokenExchangeResult): Promise<TokenExchangeResult> => {
+      if (result.type !== "success" || !result.access || !resolveProjectContextFn) {
         return result;
       }
-
-      const configuredProjectId =
-        inputProjectId ??
-        resolveConfiguredProjectId({
-          configProjectId: await options?.getConfiguredProjectId?.(),
-        });
-
       try {
         const authSnapshot = {
           type: "oauth",
@@ -77,33 +56,22 @@ export function createOAuthAuthorizeMethod(options?: OAuthAuthorizeMethodOptions
           access: result.access,
           expires: result.expires,
         } satisfies OAuthAuthDetails;
-        const projectContext = await resolveProjectContextFn(
-          authSnapshot,
-          result.access,
-          configuredProjectId,
-          undefined,
-          await options?.getUserAgentModel?.(),
-        );
-
-        if (projectContext.auth.refresh !== result.refresh && isGeminiDebugEnabled()) {
-          logGeminiDebugMessage(
-            `OAuth project resolved during auth: ${projectContext.effectiveProjectId || "none"}`,
-          );
+        const { auth } = await resolveProjectContextFn(authSnapshot, result.access);
+        if (auth.refresh !== result.refresh && isGeminiDebugEnabled()) {
+          logGeminiDebugMessage("OAuth project resolved during auth");
         }
-        return projectContext.auth.refresh !== result.refresh
-          ? { ...result, refresh: projectContext.auth.refresh }
-          : result;
+        return auth.refresh !== result.refresh ? { ...result, refresh: auth.refresh } : result;
       } catch (error) {
         if (isGeminiDebugEnabled()) {
           const message = error instanceof Error ? error.message : String(error);
-          console.warn(`[Gemini OAuth] Project resolution skipped: ${message}`);
+          console.warn(`[Google OAuth] Project resolution skipped: ${message}`);
         }
         return result;
       }
     };
 
     const isHeadless =
-      options?.isHeadless?.() ??
+      options.isHeadless?.() ??
       !!(
         process.env.SSH_CONNECTION ||
         process.env.SSH_CLIENT ||
@@ -115,7 +83,7 @@ export function createOAuthAuthorizeMethod(options?: OAuthAuthorizeMethodOptions
 
     let settled = false;
     let exchangeInFlight = false;
-    let finalResult: GeminiTokenExchangeResult | undefined;
+    let finalResult: TokenExchangeResult | undefined;
 
     const handleCallbackUrl = async (callbackUrl: URL): Promise<OAuthCallbackResponse> => {
       if (settled) {
@@ -217,8 +185,8 @@ export function createOAuthAuthorizeMethod(options?: OAuthAuthorizeMethodOptions
     if (!isHeadless) {
       try {
         listener = await startListenerFn({
-          timeoutMs: options?.timeoutMs,
-          redirectUri: options?.redirectUri,
+          timeoutMs: options.timeoutMs,
+          redirectUri: options.redirectUri,
           onCallback: handleCallbackUrl,
         });
       } catch (error) {
@@ -243,7 +211,7 @@ export function createOAuthAuthorizeMethod(options?: OAuthAuthorizeMethodOptions
         instructions:
           "Complete the sign-in flow in your browser. We'll automatically detect the redirect back to localhost.",
         method: "auto",
-        callback: async (): Promise<GeminiTokenExchangeResult> => {
+        callback: async (): Promise<TokenExchangeResult> => {
           try {
             await listener.waitForCallback();
             return (
@@ -269,9 +237,9 @@ export function createOAuthAuthorizeMethod(options?: OAuthAuthorizeMethodOptions
     return {
       url: authorization.url,
       instructions:
-        `Complete OAuth in your browser, then paste the full redirected URL (e.g., ${options?.redirectUri ?? "http://localhost:8085/oauth2callback"}?code=...&state=...) or just the authorization code.`,
+        `Complete OAuth in your browser, then paste the full redirected URL (e.g., ${options.redirectUri ?? "http://localhost:<port>/callback"}?code=...&state=...) or just the authorization code.`,
       method: "code",
-      callback: async (callbackUrl: string): Promise<GeminiTokenExchangeResult> => {
+      callback: async (callbackUrl: string): Promise<TokenExchangeResult> => {
         try {
           const { code, state, error, errorDescription } = parseOAuthCallbackInput(callbackUrl);
           if (error) {
@@ -351,7 +319,7 @@ function openBrowserUrl(url: string): void {
   } catch {}
 }
 
-function shouldIgnoreMalformedAuthCode(result: GeminiTokenExchangeResult): boolean {
+function shouldIgnoreMalformedAuthCode(result: TokenExchangeResult): boolean {
   if (result.type !== "failed") {
     return false;
   }

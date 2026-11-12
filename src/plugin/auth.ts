@@ -1,10 +1,6 @@
-import type { AuthDetails, OAuthAuthDetails, RefreshParts } from "./types";
+import type { OAuthAuthDetails, RefreshParts } from "./types";
 
 const ACCESS_TOKEN_EXPIRY_BUFFER_MS = 60 * 1000;
-
-export function isOAuthAuth(auth: AuthDetails): auth is OAuthAuthDetails {
-  return auth.type === "oauth";
-}
 
 /**
  * Splits a packed refresh string into its constituent refresh token and project IDs.

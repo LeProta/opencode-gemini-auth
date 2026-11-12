@@ -1,10 +1,8 @@
 import { randomUUID } from "node:crypto";
 
 import { GEMINI_CODE_ASSIST_ENDPOINT } from "../../constants";
-import { createGeminiActivityRequestId } from "../activity-request-id";
 import { getGeminiModelCapabilities, type GeminiThinkingMode } from "../model-config";
 import { normalizeThinkingConfig } from "../request-helpers";
-import { buildGeminiCliUserAgent } from "../user-agent";
 import { normalizeRequestPayloadIdentifiers, normalizeWrappedIdentifiers } from "./identifiers";
 import {
   addThoughtSignaturesToFunctionCalls,
@@ -77,7 +75,6 @@ export function prepareGeminiRequest(
   }`;
 
   let body = baseInit.body;
-  const activityRequestId = createGeminiActivityRequestId();
 
   if (typeof baseInit.body === "string" && baseInit.body) {
     const transformed = transformRequestBody(
@@ -96,12 +93,7 @@ export function prepareGeminiRequest(
     headers.set("Accept", "text/event-stream");
   }
 
-  headers.set("User-Agent", buildGeminiCliUserAgent(effectiveModel));
-  /**
-   * Gemini CLI injects a short request-scoped id through its activity logger.
-   * We set the same wire-visible header directly so backend/debug traces match.
-   */
-  headers.set("x-activity-request-id", activityRequestId);
+  // The User-Agent is set by toAntigravityRequest (live Antigravity client version).
 
   return {
     request: transformedUrl,

@@ -3,7 +3,6 @@ import { describe, expect, it } from "bun:test";
 import {
   accessTokenExpired,
   formatRefreshParts,
-  isOAuthAuth,
   parseRefreshParts,
 } from "./auth";
 
@@ -29,11 +28,6 @@ describe("auth helpers", () => {
         managedProjectId: "managed-456",
       }),
     ).toBe("refresh||managed-456");
-  });
-
-  it("detects OAuth auth payloads", () => {
-    expect(isOAuthAuth({ type: "oauth", refresh: "refresh" })).toBe(true);
-    expect(isOAuthAuth({ type: "api", refresh: "refresh" } as never)).toBe(false);
   });
 
   it("treats tokens near expiry as expired", () => {

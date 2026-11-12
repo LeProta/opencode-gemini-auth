@@ -30,10 +30,7 @@
     "smoke:node-import": "node -e \"Promise.all([import('opencode-gemini-auth'), import('opencode-gemini-auth/server')]).then(() => console.log('ok')).catch((error) => { console.error(error); process.exit(1); })\"",
     "prepack": "bun run build && bun run smoke:node-import",
     "prepublishOnly": "bun test && bun run prepack",
-    "check:cliproxy": "node commands/check-cliproxy.mjs",
-    "update:gemini-cli": "git -C .local/gemini-cli pull --ff-only",
-    "update:gemini-cli-version": "node commands/sync-gemini-cli-version.mjs",
-    "update:gemini-cli-sync": "npm run update:gemini-cli && npm run update:gemini-cli-version"
+    "check:cliproxy": "node commands/check-cliproxy.mjs"
   },
   "devDependencies": {
     "@types/bun": "latest",
@@ -41,7 +38,6 @@
     "typescript": "^5.9.3"
   },
   "dependencies": {
-    "@opencode/plugin": "2.0.14",
-    "@openauthjs/openauth": "^0.4.3"
+    "@opencode/plugin": "2.0.14"
   }
 }
