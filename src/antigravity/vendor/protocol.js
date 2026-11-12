@@ -1,0 +1,1061 @@
+// lib/protocol.js — pure protocol helpers for the Antigravity (Google Code Assist) bridge.
+//
+// Zero dependencies: Node built-ins only (node:crypto). Every function here is
+// synchronous and side-effect free unless it takes a plain object and returns a
+// new one. The host half (lib/index.js) owns all I/O, token storage, and HTTP.
+//
+// Protocol source of truth: the Antigravity desktop client's wire format as
+// documented by the CLIProxyAPI project (router-for-me/CLIProxyAPI, Apache-2.0).
+// Summary of the captured contract:
+//
+//   OAuth client (public, embedded in the Antigravity app — see OAUTH below):
+//     scopes        cloud-platform, userinfo.email, userinfo.profile, cclog, experimentsandconfigs
+//     redirect_uri  http://localhost:51121/oauth-callback   (fixed, registered)
+//   Registration:
+//     POST {prod}/v1internal:loadCodeAssist   {"metadata":{"ideType":"ANTIGRAVITY"}}
+//     POST {daily}/v1internal:onboardUser     {"tier_id":...}  (poll until done)
+//   Generation:
+//     POST {base}/v1internal:generateContent
+//     POST {base}/v1internal:streamGenerateContent?alt=sse
+//     envelope: { model, project, requestType:"agent", requestId:"agent-<uuid>",
+//                 userAgent:"antigravity", request:{ ...gemini payload, sessionId } }
+//   Models:
+//     POST {base}/v1internal:fetchAvailableModels
+//   Quota (per model-family pool, weekly + 5-hour windows):
+//     POST {base}/v1internal:retrieveUserQuotaSummary   {"project": ...}
+//   Streaming chunks arrive as SSE `data:` lines whose JSON is
+//     {"response": {<gemini GenerateContentResponse>}, "traceId": "..."}
+//   — unwrap `.response` when present, fall back to the bare object.
+
+import { randomUUID, createHash } from 'node:crypto';
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+// Public embedded OAuth client credentials of the shipped Antigravity app —
+// not a confidential secret: they ship inside every Antigravity install and
+// are published verbatim in CLIProxyAPI's open-source repo. Stored base64
+// encoded purely so GitHub push protection does not flag the well-known
+// plaintext patterns on every push; decoded at module load.
+const CLIENT_ID_B64 = 'MTA3MTAwNjA2MDU5MS10bWhzc2luMmgyMWxjcmUyMzV2dG9sb2poNGc0MDNlcC5hcHBzLmdvb2dsZXVzZXJjb250ZW50LmNvbQ==';
+const CLIENT_SECRET_B64 = 'R09DU1BYLUs1OEZXUjQ4NkxkTEoxbUxCOHNYQzR6NnFEQWY=';
+
+export const OAUTH = {
+  clientId: Buffer.from(CLIENT_ID_B64, 'base64').toString('utf8'),
+  clientSecret: Buffer.from(CLIENT_SECRET_B64, 'base64').toString('utf8'),
+  callbackPort: 51121,
+  callbackPath: '/oauth-callback',
+  scopes: [
+    'https://www.googleapis.com/auth/cloud-platform',
+    'https://www.googleapis.com/auth/userinfo.email',
+    'https://www.googleapis.com/auth/userinfo.profile',
+    'https://www.googleapis.com/auth/cclog',
+    'https://www.googleapis.com/auth/experimentsandconfigs',
+  ],
+  authEndpoint: 'https://accounts.google.com/o/oauth2/v2/auth',
+  tokenEndpoint: 'https://oauth2.googleapis.com/token',
+  userinfoEndpoint: 'https://www.googleapis.com/oauth2/v2/userinfo?alt=json',
+};
+
+export const API = {
+  prodBase: 'https://cloudcode-pa.googleapis.com',
+  dailyBase: 'https://daily-cloudcode-pa.googleapis.com',
+  apiVersion: 'v1internal',
+  loadCodeAssistPath: '/v1internal:loadCodeAssist',
+  onboardUserPath: '/v1internal:onboardUser',
+  generatePath: '/v1internal:generateContent',
+  streamPath: '/v1internal:streamGenerateContent',
+  fetchModelsPath: '/v1internal:fetchAvailableModels',
+  countTokensPath: '/v1internal:countTokens',
+  quotaSummaryPath: '/v1internal:retrieveUserQuotaSummary',
+};
+
+// The Antigravity hub updater manifest; its `version:` line is the currently
+// shipping desktop client version. Cloud Code rejects newer models for client
+// versions below 2.9.0, so the fallback floor must stay >= 2.9.0.
+export const VERSION = {
+  manifestUrl: 'https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/manifest/latest-arm64-mac.yml',
+  fallback: '2.9.1',
+  hubPlatform: 'darwin/arm64',
+  nodeApiClientUA: 'google-api-nodejs-client/10.3.0',
+};
+
+// ---------------------------------------------------------------------------
+// OAuth URL / form builders
+// ---------------------------------------------------------------------------
+
+export function callbackUrl() {
+  return `http://localhost:${OAUTH.callbackPort}${OAUTH.callbackPath}`;
+}
+
+export function buildAuthUrl(state) {
+  const params = new URLSearchParams({
+    access_type: 'offline',
+    client_id: OAUTH.clientId,
+    prompt: 'consent',
+    redirect_uri: callbackUrl(),
+    response_type: 'code',
+    scope: OAUTH.scopes.join(' '),
+    state,
+  });
+  return `${OAUTH.authEndpoint}?${params.toString()}`;
+}
+
+export function tokenExchangeForm(code) {
+  return new URLSearchParams({
+    code,
+    client_id: OAUTH.clientId,
+    client_secret: OAUTH.clientSecret,
+    redirect_uri: callbackUrl(),
+    grant_type: 'authorization_code',
+  });
+}
+
+export function tokenRefreshForm(refreshToken) {
+  return new URLSearchParams({
+    client_id: OAUTH.clientId,
+    client_secret: OAUTH.clientSecret,
+    grant_type: 'refresh_token',
+    refresh_token: refreshToken,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Client identity (anti-fingerprint drift)
+// ---------------------------------------------------------------------------
+
+// `v` must be a validated numeric semver (see parseVersionManifest).
+export function userAgents(version) {
+  const short = `antigravity/hub/${version} ${VERSION.hubPlatform}`;
+  return {
+    // generateContent / streamGenerateContent / loadCodeAssist / userinfo
+    short,
+    // onboardUser only: long control-plane form
+    long: `${short} ${VERSION.nodeApiClientUA}`,
+    // The real client refreshes tokens with Go's default transport UA.
+    refresh: 'Go-http-client/2.0',
+  };
+}
+
+// Parse the hub updater manifest (trivial YAML subset) into a numeric semver,
+// or null when anything is off. Mirrors CLIProxyAPI's validation: exactly three
+// all-numeric dot-separated parts.
+export function parseVersionManifest(text) {
+  if (typeof text !== 'string') return null;
+  const m = text.match(/^version:\s*("?)(\d+\.\d+\.\d+)\1\s*$/m);
+  if (!m) return null;
+  return m[2];
+}
+
+// ---------------------------------------------------------------------------
+// Gemini payload construction from an OpenAI chat.completions request
+// ---------------------------------------------------------------------------
+
+const SYSTEM_ROLES = new Set(['system', 'developer']);
+
+function textOfContent(content) {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content
+      .filter((p) => p && p.type === 'text' && typeof p.text === 'string')
+      .map((p) => p.text)
+      .join('');
+  }
+  return '';
+}
+
+function dataUrlParts(imageUrl) {
+  // data:image/png;base64,AAAA → inline_data part; http(s) URLs unsupported.
+  const m = /^data:([^;,]+)(;base64)?,(.*)$/s.exec(imageUrl || '');
+  if (!m) return null;
+  const [, mime, isB64, data] = m;
+  const payload = isB64 ? data : Buffer.from(decodeURIComponent(data), 'utf8').toString('base64');
+  return { inline_data: { mime_type: mime || 'image/png', data: payload } };
+}
+
+// JSON-Schema keywords the upstream function-declaration schema (Gemini Schema
+// proto) actually knows. It is a strict allowlist on purpose: the private
+// v1internal backend answers any unknown field with a 400 INVALID_ARGUMENT for
+// the whole request (observed with "const", which DSH tool registries emit —
+// their sanitizer keeps const/oneOf). `oneOf` itself is proven accepted: the
+// upstream error paths traverse `one_of[...]`. Everything not listed here —
+// $schema/$defs/$ref, additionalProperties, title, format, default(s),
+// example(s), minimum/maximum/exclusive*, multipleOf, min/maxLength,
+// min/maxItems, uniqueItems, pattern*, contains, if/then/else, allOf, not,
+// dependencies, x-* — is dropped, matching CLIProxyAPI's production cleaner.
+const GEMINI_SCHEMA_KEYS = new Set([
+  'type', 'description', 'enum', 'items', 'properties', 'required',
+  'anyOf', 'oneOf', 'propertyOrdering',
+]);
+
+// Gemini's proto enum is `repeated string`; stringify everything else.
+function schemaEnumValue(v) {
+  return typeof v === 'string' ? v : String(JSON.stringify(v));
+}
+
+export function sanitizeSchema(schema, depth = 0) {
+  if (depth > 12) return {};
+  if (Array.isArray(schema) || !schema || typeof schema !== 'object') {
+    return { type: 'object', properties: {} };
+  }
+  const out = {};
+  // `type` may be a JSON-Schema union like ["string","null"]; the proto takes a
+  // single type, so keep the first non-null and drop the null marker.
+  const rawType = Array.isArray(schema.type)
+    ? schema.type.find((t) => typeof t === 'string' && t !== 'null')
+    : schema.type;
+  if (typeof rawType === 'string') out.type = rawType;
+
+  for (const [k, v] of Object.entries(schema)) {
+    if (k === 'type' || !GEMINI_SCHEMA_KEYS.has(k)) continue;
+    if (k === 'properties') {
+      if (v && typeof v === 'object' && !Array.isArray(v)) {
+        out.properties = {};
+        for (const [name, sub] of Object.entries(v)) {
+          out.properties[name] = sub && typeof sub === 'object' && !Array.isArray(sub)
+            ? sanitizeSchema(sub, depth + 1)
+            : {};
+        }
+      }
+    } else if (k === 'items') {
+      out.items = v && typeof v === 'object' && !Array.isArray(v) ? sanitizeSchema(v, depth + 1) : {};
+    } else if (k === 'anyOf' || k === 'oneOf') {
+      if (Array.isArray(v)) out[k] = v.map((s) => sanitizeSchema(s, depth + 1));
+    } else if (k === 'required' || k === 'propertyOrdering') {
+      if (Array.isArray(v)) out[k] = v.filter((s) => typeof s === 'string');
+    } else if (k === 'description') {
+      if (typeof v === 'string') out.description = v;
+    } else if (k === 'enum') {
+      // Keep enums only where the proto can enforce them (string-typed or
+      // undeclared type); non-string enums are dropped like CLIProxyAPI does.
+      if (Array.isArray(v) && (out.type === 'string' || out.type === undefined)) {
+        out.enum = v.map(schemaEnumValue);
+      }
+    }
+  }
+
+  // `const` is a single-member enum; the upstream rejects the keyword itself,
+  // so rewrite it to the equivalent enum (the fix for the 400 INVALID_ARGUMENT
+  // "Unknown name \"const\"" observed from real DSH tool schemas).
+  if (schema.const !== undefined && out.enum === undefined && (out.type === 'string' || out.type === undefined)) {
+    out.enum = [schemaEnumValue(schema.const)];
+  }
+  return out;
+}
+
+// Deterministic per-conversation session id. Derived from the system prompt
+// plus the first non-system message, so it stays stable as the conversation
+// grows — matching the native client's one-session-per-conversation behavior.
+export function stableSessionId(messages) {
+  const first = (Array.isArray(messages) ? messages : []).find((m) => m && !SYSTEM_ROLES.has(m.role)) || {};
+  const seed = JSON.stringify([textOfContent(first.content) || '', (first.tool_calls || []).map((t) => t && t.id)]);
+  const hex = createHash('sha256').update(seed).digest('hex');
+  const n = BigInt('0x' + hex.slice(0, 16)); // ≤ 2^64
+  return '-' + (n % 9000000000000000000n).toString();
+}
+
+// Returns { request, toolNameByCallId, sessionId } where `request` is the
+// Gemini-format body accepted inside the antigravity envelope.
+//
+// `opts.getSignature(callId)` may return a previously captured thoughtSignature
+// for a tool-call id; it is attached to the corresponding functionCall part so
+// multi-turn tool conversations replay Gemini 3 thought signatures correctly.
+export function openaiToGeminiRequest(body, opts = {}) {
+  const getSignature = typeof opts.getSignature === 'function' ? opts.getSignature : null;
+  const messages = Array.isArray(body && body.messages) ? body.messages : [];
+
+  const systemParts = [];
+  const contents = [];
+  const toolNameByCallId = new Map();
+
+  for (const msg of messages) {
+    if (!msg || typeof msg !== 'object') continue;
+    if (SYSTEM_ROLES.has(msg.role)) {
+      const t = textOfContent(msg.content);
+      if (t) systemParts.push({ text: t });
+      continue;
+    }
+    if (msg.role === 'assistant') {
+      const parts = [];
+      const t = textOfContent(msg.content);
+      if (t) parts.push({ text: t });
+      for (const call of Array.isArray(msg.tool_calls) ? msg.tool_calls : []) {
+        if (!call || call.type !== 'function' || !call.function) continue;
+        const callId = (typeof call.id === 'string' && call.id) ? call.id : undefined;
+        if (callId) toolNameByCallId.set(callId, call.function.name);
+        let args = {};
+        try {
+          args = JSON.parse(call.function.arguments || '{}');
+          if (!args || typeof args !== 'object' || Array.isArray(args)) args = { value: args };
+        } catch {
+          args = {};
+        }
+        const part = {
+          functionCall: {
+            ...(callId ? { id: callId } : {}),
+            name: call.function.name,
+            args,
+          },
+        };
+        const signature = callId && getSignature ? getSignature(callId) : undefined;
+        if (signature) part.thoughtSignature = signature;
+        parts.push(part);
+      }
+      if (parts.length) contents.push({ role: 'model', parts });
+      continue;
+    }
+    if (msg.role === 'tool') {
+      const callId = (typeof msg.tool_call_id === 'string' && msg.tool_call_id) ? msg.tool_call_id : undefined;
+      const name = (callId && toolNameByCallId.get(callId)) || msg.name || 'tool';
+      let result = msg.content;
+      if (typeof result !== 'string') {
+        try {
+          result = JSON.stringify(result);
+        } catch {
+          result = String(result);
+        }
+      }
+      const fnRespPart = {
+        functionResponse: {
+          ...(callId ? { id: callId } : {}),
+          name,
+          response: { result: result ?? '' },
+        },
+      };
+      const prev = contents[contents.length - 1];
+      if (prev && prev.role === 'user' && Array.isArray(prev.parts) && prev.parts.every((p) => p && p.functionResponse)) {
+        prev.parts.push(fnRespPart);
+      } else {
+        contents.push({
+          role: 'user',
+          parts: [fnRespPart],
+        });
+      }
+      continue;
+    }
+    // role: user (default)
+    const parts = [];
+    const content = msg.content;
+    if (typeof content === 'string') {
+      if (content) parts.push({ text: content });
+    } else if (Array.isArray(content)) {
+      for (const p of content) {
+        if (!p || typeof p !== 'object') continue;
+        if (p.type === 'text' && typeof p.text === 'string' && p.text) parts.push({ text: p.text });
+        else if (p.type === 'image_url' && p.image_url) {
+          const inline = dataUrlParts(p.image_url.url);
+          if (inline) parts.push(inline);
+          else if (p.image_url.url) parts.push({ text: `[image omitted: ${p.image_url.url.slice(0, 120)}]` });
+        }
+      }
+    }
+    if (parts.length) contents.push({ role: 'user', parts });
+  }
+
+  const generationConfig = {};
+  if (body.temperature !== undefined && body.temperature !== null) generationConfig.temperature = body.temperature;
+  if (body.top_p !== undefined && body.top_p !== null) generationConfig.topP = body.top_p;
+  if (body.max_tokens !== undefined && body.max_tokens !== null) generationConfig.maxOutputTokens = body.max_tokens;
+  if (Array.isArray(body.stop) && body.stop.length) generationConfig.stopSequences = body.stop.map(String);
+  else if (typeof body.stop === 'string' && body.stop) generationConfig.stopSequences = [body.stop];
+
+  const request = { contents };
+  if (systemParts.length) request.systemInstruction = { role: 'user', parts: systemParts };
+  if (Object.keys(generationConfig).length) request.generationConfig = generationConfig;
+
+  if (Array.isArray(body.tools) && body.tools.length) {
+    const declarations = [];
+    for (const tool of body.tools) {
+      const fn = tool && tool.type === 'function' ? tool.function : null;
+      if (!fn || !fn.name) continue;
+      declarations.push({
+        name: fn.name,
+        description: typeof fn.description === 'string' ? fn.description : '',
+        parameters: fn.parameters ? sanitizeSchema(fn.parameters) : { type: 'object', properties: {} },
+      });
+    }
+    if (declarations.length) request.tools = [{ functionDeclarations: declarations }];
+  }
+
+  const sessionId = stableSessionId(messages);
+  return { request, sessionId, toolNameByCallId };
+}
+
+// Wrap a Gemini-format request into the antigravity envelope. `project` may be
+// '' (omitted upstream when empty).
+export function antigravityEnvelope(model, project, geminiRequest, sessionId) {
+  const request = { ...geminiRequest, sessionId };
+  delete request.safetySettings;
+  const isGemini3 = typeof model === 'string' && /gemini-3/.test(model);
+  if (isGemini3 && request.generationConfig) {
+    // gemini-3 rejects generationConfig.maxOutputTokens on this surface.
+    const { maxOutputTokens, ...rest } = request.generationConfig;
+    if (Object.keys(rest).length) request.generationConfig = rest;
+    else delete request.generationConfig;
+  }
+  const envelope = {
+    model,
+    requestType: 'agent',
+    requestId: 'agent-' + randomUUID(),
+    userAgent: 'antigravity',
+    request,
+  };
+  if (project) envelope.project = project;
+  return envelope;
+}
+
+// ---------------------------------------------------------------------------
+// Gemini response → OpenAI response translation
+// ---------------------------------------------------------------------------
+
+export function mapFinishReason(reason) {
+  switch (reason) {
+    case 'MAX_TOKENS':
+      return 'length';
+    case 'SAFETY':
+    case 'PROHIBITED_CONTENT':
+    case 'BLOCKLIST':
+    case 'SPII':
+      return 'content_filter';
+    case 'STOP':
+    case undefined:
+    case null:
+    default:
+      return 'stop';
+  }
+}
+
+export function openaiCompletionId() {
+  return 'chatcmpl-' + randomUUID().replaceAll('-', '');
+}
+
+export function mapUsage(usageMetadata) {
+  if (!usageMetadata) return undefined;
+  const prompt = usageMetadata.promptTokenCount ?? 0;
+  const completion =
+    (usageMetadata.candidatesTokenCount ?? 0) + (usageMetadata.thoughtsTokenCount ?? 0);
+  const usage = { prompt_tokens: prompt, completion_tokens: completion, total_tokens: usageMetadata.totalTokenCount ?? prompt + completion };
+  return usage;
+}
+
+// Tool-call ids are deterministic within a conversation: sha1(sessionSeed | name | args).
+// The client echoes these ids back on later turns, which is what lets us find the
+// matching thoughtSignature for replay (Gemini 3 requires signatures on
+// functionCall parts in the request history).
+function toolCallId(state, name, argsJson) {
+  let id = 'call_' + createHash('sha1').update(state.idSeed + '|' + name + '|' + argsJson).digest('hex').slice(0, 24);
+  while (state.usedIds.has(id)) id = id.slice(0, 24) + '_' + (state.dupSeq++).toString(36);
+  state.usedIds.add(id);
+  return id;
+}
+
+function pushToolCall(state, call) {
+  const argsJson = JSON.stringify(call.args ?? {});
+  const id = (typeof call.id === 'string' && call.id) ? call.id : toolCallId(state, call.name || '', argsJson);
+  state.usedIds.add(id);
+  const toolCall = {
+    id,
+    type: 'function',
+    function: { name: call.name || '', arguments: argsJson },
+  };
+  if (state.toolNameByCallId) state.toolNameByCallId.set(id, toolCall.function.name);
+  return toolCall;
+}
+
+// Translate one (unwrapped) Gemini GenerateContentResponse object into a list
+// of OpenAI delta/response fragments. Used for both streaming (state carries
+// running index/counters) and non-streaming (fresh state).
+export function geminiToOpenaiFragments(gem, state) {
+  const out = [];
+  const candidate = gem && gem.candidates && gem.candidates[0];
+  const content = candidate && candidate.content;
+  const parts = (content && content.parts) || [];
+
+  for (const part of parts) {
+    if (!part || typeof part !== 'object') continue;
+    if (part.functionCall) {
+      const toolCall = pushToolCall(state, part.functionCall);
+      if (part.thoughtSignature) state.signaturesById.set(toolCall.id, part.thoughtSignature);
+      state.toolCalls.push(toolCall);
+      continue;
+    }
+    if (typeof part.text === 'string' && part.text) {
+      if (part.thought === true) {
+        state.thinking += part.text;
+        if (state.stream) out.push({ delta: { reasoning_content: part.text } });
+      } else {
+        state.text += part.text;
+        if (state.stream) out.push({ delta: { content: part.text } });
+      }
+    }
+  }
+
+  const usage = mapUsage(gem.usageMetadata);
+  if (usage) state.usage = usage;
+
+  const finishRaw = candidate && candidate.finishReason;
+  if (finishRaw) {
+    state.finishRaw = finishRaw;
+    const finish = state.toolCalls.length ? 'tool_calls' : mapFinishReason(finishRaw);
+    if (state.stream) {
+      const delta = {};
+      if (state.toolCalls.length) delta.tool_calls = state.toolCalls.map((tc, i) => ({ index: i, ...tc }));
+      out.push({ delta, finish_reason: finish, usage });
+    } else {
+      out.push({ finish, usage });
+    }
+  }
+  return out;
+}
+
+export function freshTranslateState({ stream, idSeed }) {
+  return {
+    stream: !!stream,
+    idSeed: idSeed || '',
+    text: '',
+    thinking: '',
+    toolCalls: [],
+    toolCallSeq: 0,
+    usedIds: new Set(),
+    dupSeq: 0,
+    signaturesById: new Map(),
+    toolNameByCallId: new Map(),
+    usage: undefined,
+    finishRaw: undefined,
+  };
+}
+
+// Non-streaming: assemble a complete chat.completion object from the state.
+export function assembleNonStreamResponse(state, model) {
+  const message = { role: 'assistant', content: state.text || null };
+  if (state.thinking) message.reasoning_content = state.thinking;
+  if (state.toolCalls.length) {
+    message.tool_calls = state.toolCalls.map((tc) => ({ ...tc }));
+  }
+  return {
+    id: openaiCompletionId(),
+    object: 'chat.completion',
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [
+      {
+        index: 0,
+        message,
+        finish_reason: state.toolCalls.length ? 'tool_calls' : mapFinishReason(state.finishRaw || 'STOP'),
+      },
+    ],
+    usage: state.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+  };
+}
+
+// Extract SSE `data:` payload strings from a chunk of upstream text. Returns
+// { events: [...strings], rest: <unconsumed text> }.
+export function extractSseEvents(buffer) {
+  const events = [];
+  let idx = 0;
+  for (;;) {
+    const nl = buffer.indexOf('\n', idx);
+    if (nl === -1) break;
+    const line = buffer.slice(idx, nl).replace(/\r$/, '');
+    idx = nl + 1;
+    if (line.startsWith('data:')) {
+      events.push(line.slice(5).trimStart());
+    }
+  }
+  return { events, rest: buffer.slice(idx) };
+}
+
+// Unwrap an upstream SSE JSON object: antigravity wraps the Gemini response in
+// {"response": {...}, "traceId": "..."}; plain surfaces return the bare object.
+export function unwrapStreamChunk(obj) {
+  if (obj && typeof obj === 'object' && obj.response && typeof obj.response === 'object') return obj.response;
+  return obj;
+}
+
+// ---------------------------------------------------------------------------
+// Registration tier + model catalog parsing
+// ---------------------------------------------------------------------------
+
+// The tier that actually governs request entitlements: a paid subscription
+// (e.g. Google AI Pro → "g1-pro-tier") wins even while `currentTier` still
+// reads free-tier. Mirrors the reference client: `paidTier?.id ?? currentTier.id`.
+export function resolveTier(loadResp) {
+  if (loadResp?.paidTier?.id) return loadResp.paidTier.id;
+  if (loadResp?.currentTier?.id) return loadResp.currentTier.id;
+  return 'free-tier';
+}
+
+// Authority the bridge is willing to answer, as it appears in an HTTP Host
+// header. DSH fences its own /api surface against DNS rebinding, but a plugin
+// prefix route is dispatched before that fence, so the bridge re-implements the
+// authority half of the rule: a request addressed to a hostname we do not serve
+// is refused even though it reached us. Loopback always qualifies; a
+// non-loopback deployment (DSH bound to a LAN address) opts in explicitly by
+// listing its `host:port` in the state file's `trustedHosts`.
+export function isTrustedAuthority(host, trustedHosts = []) {
+  if (typeof host !== 'string' || !host) return false;
+  const authority = host.trim().toLowerCase();
+  if (/^(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/.test(authority)) return true;
+  return (Array.isArray(trustedHosts) ? trustedHosts : []).some(
+    (entry) => String(entry).trim().toLowerCase() === authority,
+  );
+}
+
+// First finite numeric value among `keys`, so a caller can accept both the
+// upstream spelling and a legacy alias without `??`-chaining mixed types.
+function firstNumber(source, keys) {
+  for (const key of keys) {
+    const value = source?.[key];
+    if (Number.isFinite(value)) return value;
+  }
+  return undefined;
+}
+
+// Parse a fetchAvailableModels response. Upstream returns `models` as a map
+// keyed by model id (some shapes use an array); normalize both into
+// { ids: [...], caps: { <id>: { contextLength, maxCompletionTokens } },
+//   unavailable: { <id>: <reason> } }.
+//
+// Two upstream details drive the shape:
+//
+//  * An entry the account may not use is still advertised in the catalog, but
+//    flagged `disabled: true` and carrying a human-readable
+//    `tagTitle`/`tagDescription` — e.g. `gemini-4-argon-disabled` with
+//    "Unavailable" / "Gemini 4 Argon is currently available to Ultra and paid
+//    Pro plan subscribers.". Requesting such an id only ever yields an opaque
+//    `404 NOT_FOUND`, so it is dropped from `ids` (never published into the
+//    DSH provider list) and recorded in `unavailable` so the host can explain
+//    why a later request for it failed.
+//  * Limits live in `maxTokens` (context window) and `maxOutputTokens`
+//    (completion cap); `contextLength`/`maxCompletionTokens` stay supported as
+//    aliases.
+export function parseAvailableModels(json) {
+  const raw = json && json.models;
+  const entries = Array.isArray(raw)
+    ? raw.map((m) => [typeof m === 'string' ? m : m?.id ?? m?.name, m])
+    : raw && typeof raw === 'object'
+      ? Object.entries(raw)
+      : [];
+  const ids = [];
+  const caps = {};
+  const unavailable = {};
+  for (const [id, m] of entries) {
+    if (typeof id !== 'string' || !id) continue;
+    if (m && typeof m === 'object' && (m.disabled === true || m.available === false)) {
+      unavailable[id] = String(m.tagDescription || m.tagTitle || 'not available for this account');
+      continue;
+    }
+    ids.push(id);
+    const ctx = firstNumber(m, ['contextLength', 'context_length', 'maxTokens', 'max_tokens']);
+    const maxOut = firstNumber(m, ['maxCompletionTokens', 'max_completion_tokens', 'maxOutputTokens', 'max_output_tokens']);
+    if (ctx !== undefined || maxOut !== undefined || m.supportsImages === true) {
+      caps[id] = {
+        ...(ctx !== undefined ? { contextLength: ctx } : {}),
+        ...(maxOut !== undefined ? { maxCompletionTokens: maxOut } : {}),
+        ...(m.supportsImages === true ? { supportsImages: true } : {}),
+      };
+    }
+  }
+  return { ids, caps, unavailable };
+}
+
+// ---------------------------------------------------------------------------
+// Subscription quota summary
+// ---------------------------------------------------------------------------
+
+// Parse a retrieveUserQuotaSummary response into
+//   { description, groups: [{ name, description, buckets: [
+//       { id, name, description, window, remaining, resetAt, disabled } ] }] }
+// or null when the body carries no group at all.
+//
+// Upstream facts this parser encodes:
+//  * The body is `{ groups: [...] }`; the language-server variant wraps it as
+//    `{ response: { groups } }`. Both are accepted.
+//  * Each group is a model-family pool (Gemini, Claude/GPT, Argon, ...) with a
+//    `weekly` and usually a `5h` bucket. `remainingFraction` is what is LEFT.
+//  * A spent bucket may omit `remainingFraction` and keep only `resetTime`;
+//    that means zero left, not unknown. A bucket that reports only
+//    `remainingAmount` has no percentage, so `remaining` stays null.
+//  * A `disabled` bucket (e.g. the 5h window while the weekly one is spent) is
+//    inactive, not a usable 100%.
+//  * An epoch placeholder in `resetTime` means no reset is known.
+// Group and bucket labels are upstream text and are kept verbatim.
+export function parseQuotaSummary(json) {
+  const payload = json && typeof json === 'object' && json.response && typeof json.response === 'object' && Array.isArray(json.response.groups)
+    ? json.response
+    : json;
+  const rawGroups = payload && Array.isArray(payload.groups) ? payload.groups : null;
+  if (!rawGroups || !rawGroups.length) return null;
+  const text = (value) => (typeof value === 'string' ? value : '');
+  const groups = [];
+  for (const group of rawGroups) {
+    if (!group || typeof group !== 'object') continue;
+    const buckets = [];
+    for (const bucket of Array.isArray(group.buckets) ? group.buckets : []) {
+      if (!bucket || typeof bucket !== 'object') continue;
+      let resetAt = null;
+      if (typeof bucket.resetTime === 'string') {
+        const parsed = Date.parse(bucket.resetTime);
+        // 1970-01-01... is the "nothing scheduled" placeholder
+        if (Number.isFinite(parsed) && parsed > 86_400_000) resetAt = parsed;
+      }
+      let remaining = null;
+      if (Number.isFinite(bucket.remainingFraction)) {
+        remaining = Math.max(0, Math.min(1, bucket.remainingFraction));
+      } else if (bucket.remainingAmount === undefined && resetAt !== null) {
+        remaining = 0;
+      }
+      buckets.push({
+        id: text(bucket.bucketId),
+        name: text(bucket.displayName),
+        description: text(bucket.description),
+        window: text(bucket.window),
+        remaining,
+        resetAt,
+        disabled: bucket.disabled === true,
+      });
+    }
+    groups.push({ name: text(group.displayName), description: text(group.description), buckets });
+  }
+  if (!groups.length) return null;
+  return { description: text(payload.description), groups };
+}
+
+// ---------------------------------------------------------------------------
+// settings.yaml surgical merge (auto provider configuration)
+// ---------------------------------------------------------------------------
+
+// DSH refuses a provider profile that declares no credential: the Models page
+// writes the key into $DSH_HOME/.credentials.yaml under a reference name that
+// `apiKeyEnv` points at. The bridge accepts any bearer token (it authenticates
+// upstream with the OAuth tokens, not with this key), so the plugin provisions
+// a fixed placeholder under a fixed reference name and the user never has to
+// open the Models page.
+export const PROVIDER_API_KEY_ENV = 'GEMINI_OAUTH_API_KEY';
+export const PROVIDER_PLACEHOLDER_KEY = 'dsh-gemini-oauth-bridge';
+
+// Canonical thinking levels recognized by DSH's llm-pi-ai adapter, in
+// escalation order. Upstream Antigravity catalogs expose separate model ids per
+// thinking tier (e.g. `gemini-4-argon-low`, `gemini-4-argon-medium`,
+// `gemini-4-argon-high`). Grouping them into a single base model entry with
+// `reasoningEfforts` lets the user pick the model first and the thinking effort
+// second in the DSH picker; the bridge then resolves `(model, reasoning_effort)`
+// back to the concrete upstream model id.
+export const EFFORT_SUFFIXES = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+const EFFORT_SUFFIX_RE = new RegExp(`^(.+)-(minimal|low|medium|high|xhigh|max)$`);
+
+export function splitEffortModelId(id) {
+  if (typeof id !== 'string' || !id) return null;
+  const m = id.match(EFFORT_SUFFIX_RE);
+  if (!m) return null;
+  return { baseId: m[1], effort: m[2] };
+}
+
+// Which request modalities one upstream model accepts, in the vocabulary DSH's
+// llm-pi-ai adapter reads (`input`, not `inputModalities` — the latter belongs to
+// llm-deepseek).
+//
+// The adapter defaults an entry that declares nothing to `["text"]`, so leaving
+// this out is not neutral: DSH refuses an image before it is even attached and
+// tells the user the model cannot take one. Declaring it is equally load-bearing
+// in the other direction — over-claiming admits an image the upstream then
+// rejects mid-turn, after the message is durable.
+//
+// Antigravity's catalog exposes two natively multimodal families. Everything else
+// it lists is text-only: `tab_*` tab-completion models, `chat_*` internal ids,
+// and `gpt-oss`.
+const IMAGE_MODEL_FAMILY_RE = /^(?:gemini|claude)-/;
+
+export function modelInputModalities(id, caps = null) {
+  if (typeof id !== 'string' || !id) return ['text'];
+  const cap = caps?.[id];
+  if (cap && typeof cap === 'object' && cap.supportsImages === true) return ['text', 'image'];
+  return IMAGE_MODEL_FAMILY_RE.test(id) ? ['text', 'image'] : ['text'];
+}
+
+// Group a flat list of publishable upstream model ids into DSH provider model
+// entries:
+//  - When two or more ids share a `<base>-<effort>` stem (and `base` is not
+//    also a standalone id), collapse them into `{ id: baseId,
+//    reasoningEfforts: { <effort>: <effort>, ... } }` (plus capacity fields when
+//    `modelCaps` supplies them).
+//  - A single `-<effort>` id with no sibling effort variants stays as its own
+//    `{ id }` so small/partial catalogs keep their exact id.
+export function groupModelsByEffort(ids, modelCaps = null) {
+  const list = Array.isArray(ids) ? ids.filter((id) => typeof id === 'string' && id) : [];
+  const exactSet = new Set(list);
+  const candidates = new Map(); // baseId -> { efforts: Map<effort, { fullId, idx }>, firstIdx: number }
+
+  list.forEach((id, idx) => {
+    const split = splitEffortModelId(id);
+    if (split && !exactSet.has(split.baseId)) {
+      let g = candidates.get(split.baseId);
+      if (!g) {
+        g = { efforts: new Map(), firstIdx: idx };
+        candidates.set(split.baseId, g);
+      }
+      g.efforts.set(split.effort, { fullId: id, idx });
+    }
+  });
+
+  const groupedIds = new Set();
+  const combined = [];
+
+  for (const [baseId, g] of candidates.entries()) {
+    if (g.efforts.size < 2) continue; // only collapse multi-effort families
+    const reasoningEfforts = {};
+    let ctx;
+    let maxOut;
+    for (const level of EFFORT_SUFFIXES) {
+      const item = g.efforts.get(level);
+      if (!item) continue;
+      groupedIds.add(item.fullId);
+      reasoningEfforts[level] = level;
+      const cap = modelCaps?.[item.fullId];
+      if (Number.isFinite(cap?.contextLength)) ctx = Math.max(ctx ?? 0, cap.contextLength);
+      if (Number.isFinite(cap?.maxCompletionTokens)) maxOut = Math.max(maxOut ?? 0, cap.maxCompletionTokens);
+    }
+    const hasImageCap = [...g.efforts.values()].some((it) => modelCaps?.[it.fullId]?.supportsImages === true);
+    const entry = {
+      id: baseId,
+      input: hasImageCap ? ['text', 'image'] : modelInputModalities(baseId, modelCaps),
+      reasoningEfforts,
+    };
+    if (Number.isFinite(ctx) && ctx > 0) entry.contextWindow = ctx;
+    if (Number.isFinite(maxOut) && maxOut > 0) entry.maxTokens = maxOut;
+    combined.push({ idx: g.firstIdx, entry });
+  }
+
+  list.forEach((id, idx) => {
+    if (groupedIds.has(id)) return;
+    const entry = { id, input: modelInputModalities(id, modelCaps) };
+    const cap = modelCaps?.[id];
+    if (Number.isFinite(cap?.contextLength) && cap.contextLength > 0) entry.contextWindow = cap.contextLength;
+    if (Number.isFinite(cap?.maxCompletionTokens) && cap.maxCompletionTokens > 0) entry.maxTokens = cap.maxCompletionTokens;
+    combined.push({ idx, entry });
+  });
+
+  combined.sort((a, b) => a.idx - b.idx);
+  return combined.map((x) => x.entry);
+}
+
+// Resolve a `(model, reasoningEffort)` pair arriving at `/v1/chat/completions`
+// back to the concrete upstream model id that Google Code Assist expects.
+//  1. If `model` is already an exact upstream id (or effort is absent and
+//     `model` is known), keep `model` unless `reasoningEffort` names a sibling
+//     variant `<base>-<effort>`.
+//  2. If `model` is a grouped base id (e.g. `gemini-4-argon`), pick
+//     `<model>-<reasoningEffort>` when available, otherwise fall back to the
+//     highest available effort in `availableIds` (`high` -> `medium` -> `low`...).
+export function resolveUpstreamModelId(model, reasoningEffort, availableIds = []) {
+  if (typeof model !== 'string' || !model) return model;
+  const known = new Set(Array.isArray(availableIds) ? availableIds : []);
+  const effort = typeof reasoningEffort === 'string' && reasoningEffort ? reasoningEffort.trim().toLowerCase() : '';
+
+  // Determine the base stem (works whether the caller passed `gemini-4-argon`
+  // or `gemini-4-argon-low` + a new effort override).
+  const split = splitEffortModelId(model);
+  const baseId = split && !known.has(model) ? split.baseId : model;
+
+  if (effort) {
+    const candidate = `${baseId}-${effort}`;
+    if (!known.size || known.has(candidate)) return candidate;
+    if (split) {
+      const sibling = `${split.baseId}-${effort}`;
+      if (known.has(sibling)) return sibling;
+    }
+  }
+
+  if (known.has(model)) return model;
+
+  // Fallback for a grouped base model when no effort (or an unknown effort) was
+  // supplied: prefer `high`, then `medium`, then `low`, then remaining levels.
+  const preferredOrder = ['high', 'medium', 'low', 'xhigh', 'max', 'minimal'];
+  for (const lvl of preferredOrder) {
+    const candidate = `${baseId}-${lvl}`;
+    if (known.has(candidate)) return candidate;
+  }
+
+  return effort && !split ? `${baseId}-${effort}` : model;
+}
+
+// Build the provider body lines (already indented to `indent`) for the
+// gemini-oauth provider inside llm-pi-ai.providers. Accepts either plain string
+// ids or grouped model entry objects `{ id, input, reasoningEfforts, contextWindow, maxTokens }`.
+export function buildProviderYamlLines(host, models, indent = 6) {
+  const pad = ' '.repeat(indent);
+  const lines = [
+    `${pad}api: openai-completions`,
+    `${pad}baseURL: http://${host}/gemini-oauth-bridge/v1`,
+    `${pad}apiKeyEnv: ${PROVIDER_API_KEY_ENV}`,
+    `${pad}models:`,
+  ];
+  for (const item of models) {
+    if (typeof item === 'string') {
+      lines.push(`${pad}  - id: ${item}`);
+      lines.push(`${pad}    input:`);
+      for (const modality of modelInputModalities(item)) lines.push(`${pad}      - ${modality}`);
+      continue;
+    }
+    if (!item || typeof item !== 'object' || !item.id) continue;
+    lines.push(`${pad}  - id: ${item.id}`);
+    const input = Array.isArray(item.input) && item.input.length
+      ? [...new Set(item.input)]
+      : modelInputModalities(item.id);
+    lines.push(`${pad}    input:`);
+    for (const modality of input) lines.push(`${pad}      - ${modality}`);
+    if (Number.isFinite(item.contextWindow) && item.contextWindow > 0) {
+      lines.push(`${pad}    contextWindow: ${item.contextWindow}`);
+    }
+    if (Number.isFinite(item.maxTokens) && item.maxTokens > 0) {
+      lines.push(`${pad}    maxTokens: ${item.maxTokens}`);
+    }
+    if (item.reasoningEfforts && typeof item.reasoningEfforts === 'object') {
+      lines.push(`${pad}    reasoningEfforts:`);
+      for (const [k, v] of Object.entries(item.reasoningEfforts)) {
+        lines.push(`${pad}      ${k}: ${v}`);
+      }
+    }
+  }
+  return lines;
+}
+
+const isBlank = (line) => line.trim() === '';
+const indentOf = (line) => line.length - line.trimStart().length;
+const isComment = (line) => line.trimStart().startsWith('#');
+// A mapping header like `key:` (optionally with trailing spaces). `key: value`
+// inline scalars do NOT open a nested block.
+const isBlockHeader = (line, key, indent) =>
+  indentOf(line) === indent && line.trimStart().startsWith(key + ':') && line.trimStart().slice(key.length + 1).trim() === '';
+
+// Find the exclusive end index (line number one past the end) of the block
+// opened at `start`: extends through blank lines and comments, ends at the
+// first non-blank, non-comment line whose indent is <= headerIndent.
+function blockEnd(lines, start, headerIndent) {
+  let i = start + 1;
+  for (;;) {
+    if (i >= lines.length) return i;
+    const line = lines[i];
+    if (isBlank(line) || isComment(line)) {
+      i += 1;
+      continue;
+    }
+    if (indentOf(line) <= headerIndent) return i;
+    i += 1;
+  }
+}
+
+// Merge (or create) `llm-pi-ai.providers.<name>` with the given provider body
+// lines, preserving every other byte of the document. Idempotent.
+export function mergeProviderYaml(text, name, providerLines) {
+  const lines = text.split('\n');
+  // locate top-level `llm-pi-ai:` header (not `llm-pi-ai: {inline}`)
+  let llmIdx = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (isBlockHeader(lines[i], 'llm-pi-ai', 0)) {
+      llmIdx = i;
+      break;
+    }
+    // `llm-pi-ai:` with an inline value cannot host a providers map
+    if (indentOf(lines[i]) === 0 && !isBlank(lines[i]) && !isComment(lines[i]) && lines[i].trimStart().startsWith('llm-pi-ai:')) {
+      return { ok: false, reason: 'llm-pi-ai uses an inline value; merge refused' };
+    }
+  }
+
+  if (llmIdx === -1) {
+    // append a fresh top-level block at the end
+    const out = [...lines];
+    while (out.length && isBlank(out[out.length - 1])) out.pop();
+    out.push('', 'llm-pi-ai:', '  providers:', `    ${name}:`, ...providerLines, '');
+    return { ok: true, text: out.join('\n') };
+  }
+
+  const llmEnd = blockEnd(lines, llmIdx, 0);
+  // find `  providers:` within the llm-pi-ai block
+  let provIdx = -1;
+  for (let i = llmIdx + 1; i < llmEnd; i++) {
+    if (isBlockHeader(lines[i], 'providers', 2)) {
+      provIdx = i;
+      break;
+    }
+  }
+
+  if (provIdx === -1) {
+    const out = [...lines];
+    out.splice(llmIdx + 1, 0, '  providers:', `    ${name}:`, ...providerLines);
+    return { ok: true, text: out.join('\n') };
+  }
+
+  const provEnd = blockEnd(lines, provIdx, 2);
+  // find `    <name>:` within the providers block
+  let ownIdx = -1;
+  for (let i = provIdx + 1; i < provEnd; i++) {
+    if (isBlockHeader(lines[i], name, 4)) {
+      ownIdx = i;
+      break;
+    }
+  }
+
+  const out = [...lines];
+  if (ownIdx === -1) {
+    out.splice(provIdx + 1, 0, `    ${name}:`, ...providerLines);
+    return { ok: true, text: out.join('\n') };
+  }
+  let ownEnd = blockEnd(out, ownIdx, 4);
+  // A blank run at the document tail belongs to the file, not to the provider
+  // block — keep it so repeated merges stay byte-identical.
+  while (ownEnd - 1 > ownIdx && isBlank(out[ownEnd - 1])) ownEnd -= 1;
+  out.splice(ownIdx + 1, ownEnd - ownIdx - 1, ...providerLines);
+  return { ok: true, text: out.join('\n') };
+}
+
+// Ensure `name: value` exists in the `refs:` map of a dsh-credentials-local
+// document ($DSH_HOME/.credentials.yaml, version 1). Append-only: an existing
+// reference keeps the user's value, `records:` and every comment survive, and
+// a document whose shape cannot be proven is refused rather than rewritten
+// (the loader rejects an unknown layout loudly, so guessing would brick boot).
+export function mergeCredentialYaml(text, name, value) {
+  const raw = typeof text === 'string' ? text : '';
+  const scalar = /^[A-Za-z0-9_.-]+$/.test(value) ? value : `'${String(value).replace(/'/g, "''")}'`;
+  const lines = raw.split('\n');
+  if (!lines.some((l) => !isBlank(l) && !isComment(l))) {
+    return { ok: true, created: true, text: `version: 1\nrefs:\n  ${name}: ${scalar}\n` };
+  }
+  // Already declared (at any depth — a ref name is unique in this document):
+  // never overwrite a key the user may have pasted.
+  const declared = new RegExp(`^\\s*${name}\\s*:`);
+  if (lines.some((l) => declared.test(l))) return { ok: true, created: false, text: raw };
+
+  // Only a version-1 document may be extended: an unversioned (pre-release
+  // flat) or future-versioned layout would be rewritten blindly otherwise.
+  if (!lines.some((l) => /^version\s*:\s*1\s*$/.test(l.trim()))) {
+    return { ok: false, reason: 'credentials file is not a version-1 document; add the key through the Models page' };
+  }
+
+  const out = [...lines];
+  const refsIdx = out.findIndex((l) => isBlockHeader(l, 'refs', 0));
+  if (refsIdx !== -1) {
+    // Match the indentation its siblings already use (two spaces by default).
+    let childIndent = 2;
+    const refsEnd = blockEnd(out, refsIdx, 0);
+    for (let i = refsIdx + 1; i < refsEnd; i++) {
+      if (!isBlank(out[i]) && !isComment(out[i])) {
+        childIndent = Math.max(2, indentOf(out[i]));
+        break;
+      }
+    }
+    out.splice(refsIdx + 1, 0, `${' '.repeat(childIndent)}${name}: ${scalar}`);
+    return { ok: true, created: true, text: out.join('\n') };
+  }
+
+  // No refs block yet: add one, keeping any `records:` block last.
+  const recordsIdx = out.findIndex((l) => isBlockHeader(l, 'records', 0));
+  if (recordsIdx !== -1) {
+    out.splice(recordsIdx, 0, 'refs:', `  ${name}: ${scalar}`);
+    return { ok: true, created: true, text: out.join('\n') };
+  }
+  while (out.length && isBlank(out[out.length - 1])) out.pop();
+  out.push('refs:', `  ${name}: ${scalar}`, '');
+  return { ok: true, created: true, text: out.join('\n') };
+}

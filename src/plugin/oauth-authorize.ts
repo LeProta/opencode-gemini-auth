@@ -269,7 +269,7 @@ export function createOAuthAuthorizeMethod(options?: OAuthAuthorizeMethodOptions
     return {
       url: authorization.url,
       instructions:
-        "Complete OAuth in your browser, then paste the full redirected URL (e.g., http://localhost:8085/oauth2callback?code=...&state=...) or just the authorization code.",
+        `Complete OAuth in your browser, then paste the full redirected URL (e.g., ${options?.redirectUri ?? "http://localhost:8085/oauth2callback"}?code=...&state=...) or just the authorization code.`,
       method: "code",
       callback: async (callbackUrl: string): Promise<GeminiTokenExchangeResult> => {
         try {

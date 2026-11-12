@@ -3,6 +3,8 @@ export {
   GoogleOAuthPlugin,
 } from "./src/plugin";
 
+export { GeminiAntigravityPlugin } from "./src/antigravity/plugin";
+
 export {
   authorizeGemini,
   exchangeGeminiWithVerifier,

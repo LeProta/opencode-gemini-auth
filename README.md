@@ -105,6 +105,36 @@ Check your current Gemini Code Assist quota buckets in both V1 and V2 with:
 /gquota
 ```
 
+## Antigravity (Google AI Pro / Ultra)
+
+Gemini CLI OAuth no longer serves consumer subscriptions. This fork adds a second
+provider, `google-antigravity`, that logs in through the **Antigravity** OAuth client
+and talks to `daily-cloudcode-pa.googleapis.com` exactly like
+[dsh-gemini-oauth-bridge](https://github.com/hyqhyq3/dsh-gemini-oauth-bridge):
+`requestType: "agent"` envelope, live-tracked `antigravity/hub/<version>` User-Agent,
+per-conversation `sessionId`, `loadCodeAssist`/`onboardUser` registration, and model
+discovery via `fetchAvailableModels`.
+
+1. `opencode auth login` → **Google (Antigravity)** → *OAuth with Google (Antigravity – AI Pro/Ultra)*.
+   The callback listens on `localhost:51121` (fixed by Google for this client).
+2. Pick a model under `google-antigravity/…`. The model list is discovered after login
+   and applied on the next OpenCode start (defaults until then).
+
+Same risk as the bridge: this uses the Antigravity app's public OAuth client outside
+the official app. Google may restrict the account or change the surface at any time.
+
+**Staying in sync with the bridge.** `src/antigravity/vendor/protocol.js` is the bridge's
+`lib/protocol.js`, copied verbatim; `src/antigravity/upstream.ts` records the commit.
+At startup the plugin checks GitHub (at most once a day) for newer commits touching the
+bridge's `lib/` and shows a notice. It never downloads or runs code itself. To update:
+
+```bash
+npm run update:dsh-bridge   # pulls protocol.js at the latest lib/ commit
+git diff src/antigravity    # review, then compare lib/index.js changes with src/antigravity/client.ts
+```
+
+Set `OPENCODE_ANTIGRAVITY_UPDATE_CHECK=0` to turn the check off.
+
 ## Configuration
 
 ### Google Cloud Project
