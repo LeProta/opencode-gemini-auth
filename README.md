@@ -118,8 +118,12 @@ are vendored from [dsh-gemini-oauth-bridge](https://github.com/hyqhyq3/dsh-gemin
 
 1. `opencode auth login google-antigravity` (listed as **Google**) → *OAuth with Google (AI Pro/Ultra)*.
    The callback listens on `localhost:51121` (fixed by Google for this client).
-2. Pick a model under `google-antigravity/…`. The model list is discovered after login
-   and applied on the next OpenCode start (defaults until then).
+2. Pick a model under **Google** (`google-antigravity/…`). On OpenCode V2 the list comes
+   from your account and refreshes live; models known to OpenCode keep their built-in
+   name, limits and effort variants. `<model>-low/-medium/-high` ids show up as one model
+   with variants, and Claude `*-thinking` gets low/medium/high thinking budgets.
+3. Reasoning is streamed and shown by OpenCode. `/gquota` shows the subscription's
+   weekly and 5-hour quota pools.
 
 This uses the Antigravity app's public OAuth client outside the official app. Google may
 restrict the account or change the surface at any time.
