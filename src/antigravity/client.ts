@@ -29,8 +29,8 @@ import { FALLBACK_VERSION, GOOG_API_CLIENT, antigravityEnvelope, defaultTierId, 
 
 export const ANTIGRAVITY_PROVIDER_ID = "google-antigravity";
 
-/** Same placeholder list the bridge uses until fetchAvailableModels succeeds. */
-export const DEFAULT_MODELS = ["gemini-3.1-pro-high", "gemini-3.7-flash-high", "gemini-3.1-pro-low", "gemini-3-flash"];
+/** Placeholder list until fetchAvailableModels succeeds (seen on a Google AI Pro account, 2026-11). */
+export const DEFAULT_MODELS = ["gemini-3-flash", "gemini-3.8-flash-high", "gemini-2.5-pro", "claude-sonnet-4-6"];
 
 const VERSION_TTL_MS = 6 * 60 * 60 * 1000;
 const VERSION_MEMO_MS = 10 * 60 * 1000;
