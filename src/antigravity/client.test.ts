@@ -17,7 +17,7 @@ describe("toAntigravityRequest", () => {
 
   const rewrite = (text: string) => {
     const prepared = prepareGeminiRequest(input, { method: "POST", body: text }, "tok", "proj-1");
-    return toAntigravityRequest(String(prepared.request), prepared.init, "proj-1", "2.9.1");
+    return toAntigravityRequest(String(prepared.request), prepared.init, "proj-1", "2.29.0");
   };
 
   it("targets the daily Antigravity surface with the bridge envelope", () => {
@@ -25,7 +25,9 @@ describe("toAntigravityRequest", () => {
     expect(url).toBe("https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse");
 
     const headers = new Headers(init.headers);
-    expect(headers.get("User-Agent")).toBe("antigravity/hub/2.9.1 darwin/arm64");
+    expect(headers.get("User-Agent")).toBe(
+      "antigravity/hub/2.29.0 (aidev_client; os_type=darwin; arch=arm64; cl=1013060670)",
+    );
     expect(headers.get("Authorization")).toBe("Bearer tok");
     expect(headers.has("x-activity-request-id")).toBe(false);
 
@@ -37,7 +39,7 @@ describe("toAntigravityRequest", () => {
     expect(envelope.requestId).toMatch(/^agent-[0-9a-f-]{36}$/);
     expect(envelope.request.safetySettings).toBeUndefined();
     expect(envelope.request.session_id).toBeUndefined();
-    // gemini-3 rejects maxOutputTokens on this surface
+    // CLIProxyAPI drops maxOutputTokens for every non-Claude model
     expect(envelope.request.generationConfig).toEqual({ temperature: 0.5 });
     expect(envelope.request.contents[0].parts[0].text).toBe("hello");
   });

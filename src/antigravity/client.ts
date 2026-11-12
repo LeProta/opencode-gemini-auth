@@ -1,10 +1,10 @@
 /**
  * Antigravity (Google AI Pro / Ultra subscription) pipeline for OpenCode.
  *
- * Wire format and constants come from the vendored dsh-gemini-oauth-bridge
- * `lib/protocol.js` (see ./upstream.ts for the commit). The host-side logic below
- * (version tracking, token refresh, loadCodeAssist/onboardUser, model catalog)
- * is a port of that repo's `lib/index.js`, minus the DSH-specific parts.
+ * Drifting wire details (User-Agent, registration, envelope) follow CLIProxyAPI,
+ * see ./wire.ts. Stable helpers (OAuth client, forms, manifest and catalog
+ * parsing) come from the vendored dsh-gemini-oauth-bridge `lib/protocol.js`.
+ * The host logic below started as a port of that bridge's `lib/index.js`.
  */
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -15,20 +15,17 @@ import type { GeminiTokenExchangeResult } from "../gemini/oauth";
 import { formatRefreshParts, parseRefreshParts } from "../plugin/auth";
 import { getGeminiPluginDataDir } from "../plugin/storage-paths";
 import type { OAuthAuthDetails } from "../plugin/types";
-import { DSH_BRIDGE_UPSTREAM } from "./upstream";
+import { CLIPROXY_UPSTREAM } from "./upstream";
 import {
   API,
   OAUTH,
   VERSION,
-  antigravityEnvelope,
   parseAvailableModels,
   parseVersionManifest,
-  resolveTier,
-  stableSessionId,
   tokenExchangeForm,
   tokenRefreshForm,
-  userAgents,
 } from "./vendor/protocol.js";
+import { FALLBACK_VERSION, GOOG_API_CLIENT, antigravityEnvelope, defaultTierId, onboardBody, userAgents } from "./wire";
 
 export const ANTIGRAVITY_PROVIDER_ID = "google-antigravity";
 
@@ -51,7 +48,7 @@ export interface AntigravityCache {
   models?: string[];
   modelCaps?: Record<string, ModelCaps>;
   updateCheckedAt?: number;
-  upstreamSha?: string;
+  upstreamShas?: Record<string, string>;
 }
 
 // ---------------------------------------------------------------------------
@@ -105,7 +102,7 @@ async function loadVersion(): Promise<string> {
       return version;
     }
   } catch {}
-  return cache.version && cacheAge < VERSION_TTL_MS * 4 ? cache.version : VERSION.fallback;
+  return cache.version && cacheAge < VERSION_TTL_MS * 4 ? cache.version : FALLBACK_VERSION;
 }
 
 // ---------------------------------------------------------------------------
@@ -114,15 +111,16 @@ async function loadVersion(): Promise<string> {
 
 async function upstreamJson(
   url: string,
-  { token, ua, body, method = "POST", timeoutMs = 15_000 }: {
+  { token, ua, body, method = "POST", timeoutMs = 15_000, extraHeaders }: {
     token?: string;
     ua: string;
+    extraHeaders?: Record<string, string>;
     body?: unknown;
     method?: string;
     timeoutMs?: number;
   },
 ): Promise<{ status: number; text: string; json: any }> {
-  const headers: Record<string, string> = { "Content-Type": "application/json", Accept: "*/*", "User-Agent": ua };
+  const headers: Record<string, string> = { "Content-Type": "application/json", Accept: "*/*", "User-Agent": ua, ...extraHeaders };
   if (token) headers.Authorization = `Bearer ${token}`;
   const res = await geminiFetch(url, {
     method,
@@ -227,8 +225,9 @@ export function refreshAuth(
 // ---------------------------------------------------------------------------
 
 export async function resolveProject(accessToken: string): Promise<string> {
-  const ua = userAgents(await currentVersion());
-  const load = await upstreamJson(`${API.prodBase}${API.loadCodeAssistPath}`, {
+  const version = await currentVersion();
+  const ua = userAgents(version);
+  const load = await upstreamJson(`${API.dailyBase}${API.loadCodeAssistPath}`, {
     token: accessToken,
     ua: ua.short,
     body: { metadata: { ideType: "ANTIGRAVITY" } },
@@ -239,13 +238,14 @@ export async function resolveProject(accessToken: string): Promise<string> {
   const existing = extractProject(load.json);
   if (existing) return existing;
 
-  const tierId = resolveTier(load.json);
-  for (let attempt = 0; attempt < 12; attempt++) {
+  const tierId = defaultTierId(load.json);
+  for (let attempt = 0; attempt < 5; attempt++) {
     const res = await upstreamJson(`${API.dailyBase}${API.onboardUserPath}`, {
       token: accessToken,
       ua: ua.long,
-      body: { tier_id: tierId, cloudaicompanionProject: "", metadata: { ideType: "ANTIGRAVITY" } },
-      timeoutMs: 20_000,
+      body: onboardBody(tierId, version),
+      extraHeaders: { "X-Goog-Api-Client": GOOG_API_CLIENT },
+      timeoutMs: 30_000,
     });
     if (res.status !== 200) {
       throw new Error(`Antigravity onboardUser failed (${res.status}): ${res.text.slice(0, 200)}`);
@@ -288,16 +288,9 @@ export async function refreshModels(accessToken: string, project: string): Promi
 // Request rewrite: Gemini CLI Code Assist request -> Antigravity envelope
 // ---------------------------------------------------------------------------
 
-function firstUserText(contents: unknown): string {
-  if (!Array.isArray(contents)) return "";
-  const first = contents.find((c) => c && typeof c === "object" && c.role !== "model");
-  if (!first || !Array.isArray(first.parts)) return "";
-  return first.parts.map((p: any) => (typeof p?.text === "string" ? p.text : "")).join("");
-}
-
 /**
  * Takes the output of `prepareGeminiRequest` (already sanitized for Code Assist)
- * and re-targets it at the Antigravity surface the bridge speaks.
+ * and re-targets it at the Antigravity surface.
  */
 export function toAntigravityRequest(
   url: string,
@@ -313,10 +306,9 @@ export function toAntigravityRequest(
   let body = init.body;
   if ((action === "generateContent" || action === "streamGenerateContent") && typeof body === "string") {
     const wrapped = JSON.parse(body) as { model: string; request?: Record<string, unknown> };
+    // Drop the Gemini CLI per-process session_id; the envelope derives one per conversation.
     const { session_id: _ignored, ...request } = wrapped.request ?? {};
-    // One upstream session per conversation, derived like the bridge does.
-    const sessionId = stableSessionId([{ role: "user", content: firstUserText(request.contents) }]);
-    body = JSON.stringify(antigravityEnvelope(wrapped.model, project, request, sessionId));
+    body = JSON.stringify(antigravityEnvelope(wrapped.model, project, request));
   }
 
   return {
@@ -329,31 +321,35 @@ export function toAntigravityRequest(
 // Upstream update check (notice only: never downloads or runs code)
 // ---------------------------------------------------------------------------
 
-export async function checkBridgeUpdate(notify: (message: string) => void): Promise<void> {
+export async function checkUpstreamUpdate(notify: (message: string) => void): Promise<void> {
   if (process.env.OPENCODE_ANTIGRAVITY_UPDATE_CHECK === "0") return;
-  const vendored = DSH_BRIDGE_UPSTREAM.sha;
+  const { repo, files } = CLIPROXY_UPSTREAM;
   const cache = await readCache();
-  let latest = cache.upstreamSha;
+  let latest = cache.upstreamShas;
   if (Date.now() - (cache.updateCheckedAt ?? 0) >= UPDATE_CHECK_TTL_MS) {
     try {
-      const res = await geminiFetch(
-        `https://api.github.com/repos/${DSH_BRIDGE_UPSTREAM.repo}/commits?path=lib&per_page=1`,
-        {
-          headers: { "User-Agent": "opencode-gemini-auth", Accept: "application/vnd.github+json" },
-          signal: AbortSignal.timeout(5_000),
-        },
+      const entries = await Promise.all(
+        Object.keys(files).map(async (path) => {
+          const res = await geminiFetch(`https://api.github.com/repos/${repo}/commits?path=${path}&per_page=1`, {
+            headers: { "User-Agent": "opencode-gemini-auth", Accept: "application/vnd.github+json" },
+            signal: AbortSignal.timeout(5_000),
+          });
+          if (!res.ok) throw new Error(`GitHub ${res.status}`);
+          const [commit] = (await res.json()) as Array<{ sha?: string }>;
+          return [path, commit?.sha ?? ""] as const;
+        }),
       );
-      if (res.ok) {
-        const [commit] = (await res.json()) as Array<{ sha?: string }>;
-        latest = commit?.sha;
-        await writeCache({ updateCheckedAt: Date.now(), upstreamSha: latest });
-      }
+      latest = Object.fromEntries(entries);
+      await writeCache({ updateCheckedAt: Date.now(), upstreamShas: latest });
     } catch {}
   }
-  if (latest && latest !== vendored) {
+  const changed = Object.entries(files)
+    .filter(([path, reviewed]) => latest?.[path] && latest[path] !== reviewed)
+    .map(([path]) => path.split("/").pop());
+  if (changed.length) {
     notify(
-      `${DSH_BRIDGE_UPSTREAM.repo} changed its pipeline (${latest.slice(0, 7)}, vendored ${vendored.slice(0, 7)}). ` +
-        "Run `npm run update:dsh-bridge` in the plugin repo, review the diff, and rebuild.",
+      `${repo} changed its Antigravity protocol files (${changed.join(", ")}). ` +
+        "Run `npm run check:cliproxy` in the plugin repo, port the diff into src/antigravity/wire.ts, then accept.",
     );
   }
 }

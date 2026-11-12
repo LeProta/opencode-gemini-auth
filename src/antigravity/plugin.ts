@@ -10,7 +10,7 @@ import type { GetAuth, OAuthAuthDetails, PluginContext, PluginResult, Provider }
 import {
   ANTIGRAVITY_PROVIDER_ID,
   DEFAULT_MODELS,
-  checkBridgeUpdate,
+  checkUpstreamUpdate,
   currentVersion,
   exchangeCode,
   readCache,
@@ -48,10 +48,10 @@ function buildModels(ids: string[], caps: Record<string, ModelCaps> = {}) {
  * Antigravity OAuth surface (pipeline from dsh-gemini-oauth-bridge).
  */
 export const GeminiAntigravityPlugin = async ({ client }: PluginContext): Promise<PluginResult> => {
-  void checkBridgeUpdate((message) => {
+  void checkUpstreamUpdate((message) => {
     console.warn(`[Antigravity] ${message}`);
     client.tui
-      ?.showToast({ body: { title: "Antigravity pipeline update", message, variant: "info", duration: 10_000 } })
+      ?.showToast({ body: { title: "Antigravity protocol update", message, variant: "info", duration: 10_000 } })
       .catch(() => {});
   });
 
