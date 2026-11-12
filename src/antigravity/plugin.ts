@@ -85,7 +85,7 @@ export const GeminiAntigravityPlugin = async ({ client }: PluginContext): Promis
       const existing = (config.provider[ANTIGRAVITY_PROVIDER_ID] ?? {}) as Record<string, any>;
       (config.provider as Record<string, unknown>)[ANTIGRAVITY_PROVIDER_ID] = {
         npm: "@ai-sdk/google",
-        name: "Google (Antigravity)",
+        name: "Google",
         ...existing,
         // User-defined model entries win over discovered ones.
         models: { ...buildModels(ids, cache.modelCaps), ...(existing.models ?? {}) },
@@ -138,7 +138,7 @@ export const GeminiAntigravityPlugin = async ({ client }: PluginContext): Promis
       },
       methods: [
         {
-          label: "OAuth with Google (Antigravity – AI Pro/Ultra)",
+          label: "OAuth with Google (AI Pro/Ultra)",
           type: "oauth",
           authorize: authorizeAntigravity,
         },

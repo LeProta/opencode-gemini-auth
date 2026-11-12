@@ -22,6 +22,7 @@ import { groupModelsByEffort, resolveUpstreamModelId } from "./vendor/protocol.j
 
 const METHOD_ID = Integration.MethodID.make("antigravity");
 const MARKER = "opencode.provider.google-antigravity";
+const DISPLAY_NAME = "Google";
 /** Set by a model variant; the request hook maps (model, effort) back to the upstream id. */
 const EFFORT_HEADER = "x-antigravity-effort";
 
@@ -70,7 +71,7 @@ export async function setupAntigravityV2(ctx: V2Context): Promise<Plugin.Cleanup
   await ctx.integration.transform((draft) => {
     draft.method.update({
       integrationID: ANTIGRAVITY_PROVIDER_ID,
-      method: { id: METHOD_ID, type: "oauth", label: "OAuth with Google (Antigravity – AI Pro/Ultra)" },
+      method: { id: METHOD_ID, type: "oauth", label: "OAuth with Google (AI Pro/Ultra)" },
       authorize: async () => {
         const authorization = await authorizeAntigravity();
         return authorization.method === "auto"
@@ -97,6 +98,10 @@ export async function setupAntigravityV2(ctx: V2Context): Promise<Plugin.Cleanup
       label: (credential) =>
         typeof credential.metadata?.email === "string" ? credential.metadata.email : undefined,
     });
+    // Without this the connection list shows the raw id `google-antigravity`.
+    draft.update(ANTIGRAVITY_PROVIDER_ID, (integration) => {
+      integration.name = DISPLAY_NAME;
+    });
   });
 
   const cache = await readCache();
@@ -114,7 +119,7 @@ export async function setupAntigravityV2(ctx: V2Context): Promise<Plugin.Cleanup
         id: ANTIGRAVITY_PROVIDER_ID,
         canonical: undefined,
         integrationID: ANTIGRAVITY_PROVIDER_ID,
-        name: "Google (Antigravity)",
+        name: DISPLAY_NAME,
       } as unknown as typeof template.provider,
       // `gemini-3.8-flash-{low,medium,high}` becomes one model with low/medium/high variants.
       models: groupModelsByEffort(ids, (cache.modelCaps ?? null) as any).map((group: any) => {

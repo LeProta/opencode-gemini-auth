@@ -116,7 +116,7 @@ per-conversation `sessionId`, `loadCodeAssist`/`onboardUser` registration, and m
 discovery via `fetchAvailableModels`. Stable helpers (OAuth client, forms, catalog parsing)
 are vendored from [dsh-gemini-oauth-bridge](https://github.com/hyqhyq3/dsh-gemini-oauth-bridge).
 
-1. `opencode auth login` → **Google (Antigravity)** → *OAuth with Google (Antigravity – AI Pro/Ultra)*.
+1. `opencode auth login google-antigravity` (listed as **Google**) → *OAuth with Google (AI Pro/Ultra)*.
    The callback listens on `localhost:51121` (fixed by Google for this client).
 2. Pick a model under `google-antigravity/…`. The model list is discovered after login
    and applied on the next OpenCode start (defaults until then).
