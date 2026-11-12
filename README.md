@@ -17,14 +17,14 @@ Requires **OpenCode V2** (the plugin ships only the V2 `./server` entry point).
 
 ## Install
 
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "plugins": ["file:///path/to/opencode-gemini-auth"]
-}
+```bash
+opencode plugin add github:LeProta/opencode-gemini-auth
 ```
 
-Build once with `bun install && bun run build` (or `npx tsup`).
+or, for a local checkout, `"plugins": ["file:///path/to/opencode-gemini-auth"]` in `opencode.json`.
+
+`dist/` is committed, so nothing needs building to install. After changing the code, run
+`bun run bundle` (or `npx tsup`) and commit `dist/`.
 
 ## Sign in
 
