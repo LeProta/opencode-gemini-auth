@@ -3,7 +3,7 @@ node_modules
 
 # output
 out
-dist
+# dist/ is committed: OpenCode installs git plugins without running a build
 *.tgz
 
 # code coverage
