@@ -1,6 +1,6 @@
 import { Integration, Plugin, type Credential } from "@opencode/plugin";
 
-import { setupAntigravityV2 } from "./antigravity/plugin-v2";
+import { antigravityQuotaReport, setupAntigravityV2 } from "./antigravity/plugin-v2";
 import { GEMINI_PROVIDER_ID } from "./constants";
 import { geminiFetch } from "./fetch";
 import type { GeminiTokenExchangeResult } from "./gemini/oauth";
@@ -458,6 +458,14 @@ export async function setupV2(ctx: V2Context): Promise<Plugin.Cleanup> {
       },
     });
 
+  /** /gquota covers both logins: the Antigravity subscription first, Gemini CLI when connected. */
+  const runCombinedQuotaLookup = async (): Promise<{ ok: boolean; text: string; projectId?: string }> => {
+    const [gemini, antigravity] = await Promise.all([runQuotaLookup(), antigravityQuotaReport(ctx)]);
+    if (!antigravity) return gemini;
+    if (!gemini.ok) return antigravity;
+    return { ok: true, text: [antigravity.text, gemini.text].join("\n\n"), projectId: gemini.projectId };
+  };
+
   if (typeof ctx.tool?.transform === "function") {
     await ctx.tool.transform((draft) => {
       draft.add({
@@ -466,9 +474,8 @@ export async function setupV2(ctx: V2Context): Promise<Plugin.Cleanup> {
           "Retrieve Gemini Code Assist quota usage and remaining buckets for the active OAuth account.",
         input: geminiQuotaInputSchema,
         execute: async () => {
-          const report = await runQuotaLookup();
+          const report = await runCombinedQuotaLookup();
           return {
-            output: report.text,
             content: report.text,
             metadata: {
               ok: report.ok,
@@ -484,9 +491,9 @@ export async function setupV2(ctx: V2Context): Promise<Plugin.Cleanup> {
     await ctx.command.transform((draft) => {
       draft.add({
         name: "gquota",
-        description: "Show Gemini Code Assist quota usage",
+        description: "Show Google subscription and Gemini Code Assist quota usage",
         execute: async (input) => {
-          const report = await runQuotaLookup();
+          const report = await runCombinedQuotaLookup();
           if (typeof ctx.session.synthetic === "function") {
             await ctx.session.synthetic({
               sessionID: input.sessionID,

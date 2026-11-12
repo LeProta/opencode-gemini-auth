@@ -724,8 +724,8 @@ test("V2 registers gemini_quota tool and /gquota command via session.synthetic",
   expect(tool).toBeDefined();
   const toolResult = await tool.execute({}, { signal: new AbortController().signal });
   expect(toolResult.metadata).toMatchObject({ ok: true, projectId: "managed-project" });
-  expect(toolResult.output).toContain("Gemini quota usage for project `managed-project`");
-  expect(toolResult.output).toContain("80.0% (160 left)");
+  expect(toolResult.content).toContain("Gemini quota usage for project `managed-project`");
+  expect(toolResult.content).toContain("80.0% (160 left)");
 
   const command = ctx.commands.get("gquota");
   expect(command).toBeDefined();

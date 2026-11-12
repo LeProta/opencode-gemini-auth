@@ -71,6 +71,8 @@ describe("withThoughts", () => {
     expect(tc("gemini-3-flash")).toEqual({ includeThoughts: true, thinkingLevel: "high" });
     expect(tc("gemini-2.5-flash-thinking")).toEqual({ includeThoughts: true, thinkingBudget: -1 });
     expect(tc("claude-opus-4-6-thinking")).toEqual({ includeThoughts: true, thinkingBudget: 8192 });
+    expect(withThoughts("claude-opus-4-6-thinking", {}, "high").generationConfig.thinkingConfig.thinkingBudget).toBe(24576);
+    expect(withThoughts("claude-opus-4-6-thinking", {}, "low").generationConfig.thinkingConfig.thinkingBudget).toBe(1024);
   });
 
   it("leaves non-thinking Claude, image models and explicit opt-outs alone", () => {
@@ -79,5 +81,30 @@ describe("withThoughts", () => {
     expect(tc("gemini-3-flash", { generationConfig: { thinkingConfig: { includeThoughts: false } } })).toEqual({
       includeThoughts: false,
     });
+  });
+});
+
+describe("formatQuotaSummary", () => {
+  const { formatQuotaSummary } = require("./client") as typeof import("./client");
+  it("prints each pool and window with what is left and the reset", () => {
+    const now = Date.UTC(2026, 10, 12, 12);
+    const text = formatQuotaSummary(
+      {
+        description: "",
+        groups: [
+          {
+            name: "Gemini",
+            description: "",
+            buckets: [
+              { name: "Weekly limit", window: "weekly", remaining: 0.42, resetAt: now + 3 * 86_400_000, disabled: false },
+              { name: "", window: "5h", remaining: null, resetAt: now + 90 * 60_000, disabled: true },
+            ],
+          },
+        ],
+      },
+      now,
+    );
+    expect(text).toContain("- Weekly limit: 42% left, resets in 3 days");
+    expect(text).toContain("- 5h: inactive, resets in 1 h 30 min");
   });
 });

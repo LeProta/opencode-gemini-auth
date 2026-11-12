@@ -21,6 +21,7 @@ import {
   OAUTH,
   VERSION,
   parseAvailableModels,
+  parseQuotaSummary,
   parseVersionManifest,
   splitEffortModelId,
   tokenExchangeForm,
@@ -57,8 +58,24 @@ export interface AntigravityCache {
 // ---------------------------------------------------------------------------
 
 const cachePath = () => join(getGeminiPluginDataDir(), "antigravity.json");
+const STORAGE_KEY = "antigravity-cache";
 
-export async function readCache(): Promise<AntigravityCache> {
+export interface CacheStorage {
+  get(key: string): Promise<unknown>;
+  set(key: string, value: any): Promise<void>;
+}
+
+let storage: CacheStorage | undefined;
+let memo: Promise<AntigravityCache> | undefined;
+
+/** OpenCode V2: keep the cache in the plugin's storage instead of a file of our own. */
+export function useCacheStorage(next: CacheStorage): void {
+  if (storage) return;
+  storage = next;
+  memo = undefined;
+}
+
+async function readFileCache(): Promise<AntigravityCache> {
   try {
     return JSON.parse(await readFile(cachePath(), "utf8")) as AntigravityCache;
   } catch {
@@ -66,9 +83,28 @@ export async function readCache(): Promise<AntigravityCache> {
   }
 }
 
-async function writeCache(patch: AntigravityCache): Promise<void> {
+async function loadCache(): Promise<AntigravityCache> {
+  if (!storage) return readFileCache();
   try {
-    const next = { ...(await readCache()), ...patch };
+    const stored = await storage.get(STORAGE_KEY);
+    if (stored && typeof stored === "object") return stored as AntigravityCache;
+  } catch {}
+  return readFileCache(); // one-time migration from the old file
+}
+
+export function readCache(): Promise<AntigravityCache> {
+  memo ??= loadCache();
+  return memo;
+}
+
+async function writeCache(patch: AntigravityCache): Promise<void> {
+  const next = { ...(await readCache()), ...patch };
+  memo = Promise.resolve(next);
+  try {
+    if (storage) {
+      await storage.set(STORAGE_KEY, next);
+      return;
+    }
     await mkdir(getGeminiPluginDataDir(), { recursive: true });
     await writeFile(cachePath(), JSON.stringify(next, null, 2));
   } catch {}
@@ -263,7 +299,7 @@ export function isPublishableModelId(id: string): boolean {
   return !!id && !/^(chat_|tab_)/.test(id);
 }
 
-/** Refreshes the cached catalog; the new list is registered on the next OpenCode start. */
+/** Refreshes the cached catalog. Returns the publishable ids, or undefined when upstream gave none. */
 export async function refreshModels(accessToken: string, project: string): Promise<string[] | undefined> {
   const ua = userAgents(await currentVersion());
   for (const base of [API.prodBase, API.dailyBase]) {
@@ -285,6 +321,56 @@ export async function refreshModels(accessToken: string, project: string): Promi
   return undefined;
 }
 
+/** Subscription quota pools (weekly / 5-hour windows), as the bridge reads them. */
+export async function fetchQuotaSummary(accessToken: string, project: string): Promise<QuotaSummary | null> {
+  const ua = userAgents(await currentVersion());
+  for (const base of [API.dailyBase, API.prodBase]) {
+    try {
+      const res = await upstreamJson(`${base}${API.quotaSummaryPath}`, {
+        token: accessToken,
+        ua: ua.short,
+        body: project ? { project } : {},
+      });
+      if (res.status !== 200) continue;
+      const summary = parseQuotaSummary(res.json) as QuotaSummary | null;
+      if (summary) return summary;
+    } catch {}
+  }
+  return null;
+}
+
+export interface QuotaSummary {
+  description: string;
+  groups: Array<{
+    name: string;
+    description: string;
+    buckets: Array<{ name: string; window: string; remaining: number | null; resetAt: number | null; disabled: boolean }>;
+  }>;
+}
+
+export function formatQuotaSummary(summary: QuotaSummary, now = Date.now()): string {
+  const lines = ["Google subscription quota:"];
+  for (const group of summary.groups) {
+    lines.push("", `${group.name || "Models"}`);
+    for (const bucket of group.buckets) {
+      const label = bucket.name || bucket.window || "quota";
+      const left = bucket.disabled ? "inactive" : bucket.remaining === null ? "unknown" : `${Math.round(bucket.remaining * 100)}% left`;
+      const reset = bucket.resetAt ? `, resets in ${formatDuration(bucket.resetAt - now)}` : "";
+      lines.push(`- ${label}: ${left}${reset}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+function formatDuration(ms: number): string {
+  if (ms <= 0) return "now";
+  const minutes = Math.round(ms / 60_000);
+  if (minutes < 60) return `${minutes} min`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 48) return `${hours} h ${minutes % 60} min`;
+  return `${Math.round(hours / 24)} days`;
+}
+
 // ---------------------------------------------------------------------------
 // Request rewrite: Gemini CLI Code Assist request -> Antigravity envelope
 // ---------------------------------------------------------------------------
@@ -294,18 +380,22 @@ export async function refreshModels(accessToken: string, project: string): Promi
  * shows as reasoning). Upstream ignores `includeThoughts` on its own: like CLIProxyAPI,
  * pair it with a level (Gemini 3, from the `-low/-medium/-high` id suffix) or a budget.
  */
-export function withThoughts(model: string, request: Record<string, any>): Record<string, any> {
+/** CLIProxyAPI's level -> budget map (internal/thinking/convert.go). */
+const CLAUDE_BUDGETS: Record<string, number> = { low: 1024, medium: 8192, high: 24576 };
+
+export function withThoughts(model: string, request: Record<string, any>, effort?: string): Record<string, any> {
   if (model.includes("image")) return request;
   const generationConfig = request.generationConfig ?? {};
   const current = generationConfig.thinkingConfig ?? {};
   if (current.includeThoughts === false) return request;
   const thinkingConfig: Record<string, unknown> = { ...current, includeThoughts: true };
   if (current.thinkingLevel === undefined && current.thinkingBudget === undefined) {
-    const effort = splitEffortModelId(model)?.effort;
-    if (/gemini-3/.test(model)) thinkingConfig.thinkingLevel = effort === "medium" || effort === "low" ? effort : "high";
+    // Gemini ids carry their effort (`-low`); Claude `*-thinking` gets it from the variant.
+    const idEffort = splitEffortModelId(model)?.effort;
+    if (/gemini-3/.test(model)) thinkingConfig.thinkingLevel = idEffort === "medium" || idEffort === "low" ? idEffort : "high";
     else if (/claude/.test(model)) {
       if (!/thinking/.test(model)) return request; // non-thinking Claude rejects a budget
-      thinkingConfig.thinkingBudget = 8192;
+      thinkingConfig.thinkingBudget = CLAUDE_BUDGETS[effort ?? ""] ?? CLAUDE_BUDGETS.medium;
     } else thinkingConfig.thinkingBudget = -1; // dynamic (Gemini 2.5)
   }
   return { ...request, generationConfig: { ...generationConfig, thinkingConfig } };
@@ -320,6 +410,7 @@ export function toAntigravityRequest(
   init: RequestInit,
   project: string,
   version: string,
+  effort?: string,
 ): { url: string; init: RequestInit } {
   const headers = new Headers(init.headers);
   headers.set("User-Agent", userAgents(version).short);
@@ -331,7 +422,7 @@ export function toAntigravityRequest(
     const wrapped = JSON.parse(body) as { model: string; request?: Record<string, unknown> };
     // Drop the Gemini CLI per-process session_id; the envelope derives one per conversation.
     const { session_id: _ignored, ...request } = wrapped.request ?? {};
-    body = JSON.stringify(antigravityEnvelope(wrapped.model, project, withThoughts(wrapped.model, request)));
+    body = JSON.stringify(antigravityEnvelope(wrapped.model, project, withThoughts(wrapped.model, request, effort)));
   }
 
   return {
@@ -344,8 +435,11 @@ export function toAntigravityRequest(
 // Upstream update check (notice only: never downloads or runs code)
 // ---------------------------------------------------------------------------
 
+let updateChecked = false;
+
 export async function checkUpstreamUpdate(notify: (message: string) => void): Promise<void> {
-  if (process.env.OPENCODE_ANTIGRAVITY_UPDATE_CHECK === "0") return;
+  if (process.env.OPENCODE_ANTIGRAVITY_UPDATE_CHECK === "0" || updateChecked) return;
+  updateChecked = true;
   const { repo, files } = CLIPROXY_UPSTREAM;
   const cache = await readCache();
   let latest = cache.upstreamShas;
