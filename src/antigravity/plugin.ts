@@ -43,9 +43,28 @@ function buildModels(ids: string[], caps: Record<string, ModelCaps> = {}) {
   );
 }
 
+/** Shared by the V1 and V2 entry points. */
+export const authorizeAntigravity = createOAuthAuthorizeMethod({
+  redirectUri: callbackUrl(),
+  authorizeFn: async () => {
+    const state = randomBytes(32).toString("hex");
+    return { url: buildAuthUrl(state), verifier: "", state };
+  },
+  exchangeFn: (code) => exchangeCode(code),
+  resolveProjectContextFn: async (auth, accessToken) => {
+    const projectId = await resolveProject(accessToken);
+    void refreshModels(accessToken, projectId);
+    const { refreshToken } = parseRefreshParts(auth.refresh);
+    return {
+      auth: { ...auth, refresh: formatRefreshParts({ refreshToken, projectId }) },
+      effectiveProjectId: projectId,
+    };
+  },
+});
+
 /**
  * OpenCode provider `google-antigravity`: Google AI Pro / Ultra subscription via the
- * Antigravity OAuth surface (pipeline from dsh-gemini-oauth-bridge).
+ * Antigravity OAuth surface (wire format from CLIProxyAPI).
  */
 export const GeminiAntigravityPlugin = async ({ client }: PluginContext): Promise<PluginResult> => {
   void checkUpstreamUpdate((message) => {
@@ -121,23 +140,7 @@ export const GeminiAntigravityPlugin = async ({ client }: PluginContext): Promis
         {
           label: "OAuth with Google (Antigravity – AI Pro/Ultra)",
           type: "oauth",
-          authorize: createOAuthAuthorizeMethod({
-            redirectUri: callbackUrl(),
-            authorizeFn: async () => {
-              const state = randomBytes(32).toString("hex");
-              return { url: buildAuthUrl(state), verifier: "", state };
-            },
-            exchangeFn: (code) => exchangeCode(code),
-            resolveProjectContextFn: async (auth, accessToken) => {
-              const projectId = await resolveProject(accessToken);
-              void refreshModels(accessToken, projectId);
-              const { refreshToken } = parseRefreshParts(auth.refresh);
-              return {
-                auth: { ...auth, refresh: formatRefreshParts({ refreshToken, projectId }) },
-                effectiveProjectId: projectId,
-              };
-            },
-          }),
+          authorize: authorizeAntigravity,
         },
       ],
     },

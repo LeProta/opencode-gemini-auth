@@ -1,5 +1,6 @@
 import { Integration, Plugin, type Credential } from "@opencode/plugin";
 
+import { setupAntigravityV2 } from "./antigravity/plugin-v2";
 import { GEMINI_PROVIDER_ID } from "./constants";
 import { geminiFetch } from "./fetch";
 import type { GeminiTokenExchangeResult } from "./gemini/oauth";
@@ -970,5 +971,10 @@ function toUrlString(input: RequestInfo): string {
 
 export default Plugin.define({
   id: "Gemini OAuth Plugin",
-  setup: setupV2,
+  setup: async (ctx) => {
+    const cleanups = [await setupV2(ctx), await setupAntigravityV2(ctx)];
+    return async () => {
+      for (const cleanup of cleanups) await cleanup?.();
+    };
+  },
 });

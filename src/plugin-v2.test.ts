@@ -75,7 +75,7 @@ test("V2 plugin registers OAuth and rewrites Gemini requests and responses", asy
   const { method, hooks } = await setup();
 
   expect(plugin.id).toBe("Gemini OAuth Plugin");
-  expect(plugin.setup).toBe(setupV2);
+  expect(typeof plugin.setup).toBe("function");
   expect(method.integrationID).toBe("google");
   expect(method.method.id).toBe("gemini-cli");
 
