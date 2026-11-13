@@ -62,15 +62,22 @@ export function readCache(): Promise<AntigravityCache> {
   return memo;
 }
 
-export async function writeCache(patch: AntigravityCache): Promise<void> {
-  const next = { ...(await readCache()), ...patch };
-  memo = Promise.resolve(next);
-  try {
-    if (storage) {
-      await storage.set(STORAGE_KEY, next);
-      return;
-    }
-    await mkdir(getGeminiPluginDataDir(), { recursive: true });
-    await writeFile(cachePath(), JSON.stringify(next, null, 2));
-  } catch {}
+let writes: Promise<void> = Promise.resolve();
+
+export function writeCache(patch: AntigravityCache): Promise<void> {
+  // Chained on the memo and on the previous write: two writes started together
+  // used to read the same snapshot, and the second one dropped the first one's patch.
+  const merged = (memo = readCache().then((current) => ({ ...current, ...patch })));
+  writes = writes.then(async () => {
+    const next = await merged;
+    try {
+      if (storage) {
+        await storage.set(STORAGE_KEY, next);
+        return;
+      }
+      await mkdir(getGeminiPluginDataDir(), { recursive: true });
+      await writeFile(cachePath(), JSON.stringify(next, null, 2));
+    } catch {}
+  });
+  return writes;
 }
