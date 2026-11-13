@@ -230,7 +230,8 @@ describe("fetchWithRetry", () => {
     expect(firstResponse.status).toBe(429);
     expect(secondResponse.status).toBe(200);
     expect(fetchMock.mock.calls.length).toBe(2);
-    expect(scheduledDelays).toContain(8000);
+    // The wait is the 8 s cooldown minus the milliseconds already elapsed since it was recorded.
+    expect(scheduledDelays.some((delay) => delay > 7_000 && delay <= 8_000)).toBe(true);
   });
 
   it("retries model capacity exhaustion when server provides RetryInfo", async () => {
