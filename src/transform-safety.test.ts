@@ -1,8 +1,8 @@
 import { describe, expect, it } from "bun:test";
 
-import { readPrefix } from "../bounded";
-import { prepareGeminiRequest } from "../plugin/request";
-import { isTrustedGoogleUrl, toAntigravityRequest } from "./client";
+import { readPrefix } from "./bounded";
+import { prepareGeminiRequest } from "./request";
+import { isTrustedGoogleUrl, toAntigravityRequest } from "./transform";
 
 describe("outgoing Antigravity request safety", () => {
   const input = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash:generateContent";

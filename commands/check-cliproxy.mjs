@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Lists CLIProxyAPI commits not yet reviewed for the files src/antigravity/wire.ts mirrors.
+// Lists CLIProxyAPI commits not yet reviewed for the files src/wire.ts mirrors.
 //   npm run check:cliproxy               show what changed, with diff links
 //   npm run check:cliproxy -- --accept   record the latest commits as reviewed
 import { readFile, writeFile } from "node:fs/promises";
@@ -7,7 +7,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-const upstreamPath = join(root, "src/antigravity/upstream.ts");
+const upstreamPath = join(root, "src/upstream.ts");
 const source = await readFile(upstreamPath, "utf8");
 const repo = source.match(/repo: "([^"]+)"/)[1];
 const files = Object.fromEntries([...source.matchAll(/"([^"]+\.go)": "([0-9a-f]{40})"/g)].map((m) => [m[1], m[2]]));
@@ -34,7 +34,7 @@ for (const [path, reviewed] of Object.entries(files)) {
 
 if (process.argv.includes("--accept")) {
   await writeFile(upstreamPath, next);
-  console.log(pending ? "Recorded the latest commits as reviewed in src/antigravity/upstream.ts." : "Nothing to record.");
+  console.log(pending ? "Recorded the latest commits as reviewed in src/upstream.ts." : "Nothing to record.");
 } else if (pending) {
-  console.log("\nPort what matters into src/antigravity/wire.ts, run the tests, then rerun with -- --accept.");
+  console.log("\nPort what matters into src/wire.ts, run the tests, then rerun with -- --accept.");
 }

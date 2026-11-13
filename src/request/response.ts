@@ -5,7 +5,7 @@ import {
   parseGeminiApiBody,
   rewriteGeminiPreviewAccessError,
   type GeminiApiBody,
-} from "../request-helpers";
+} from "./helpers";
 import { injectResponseIdFromTrace, isRecord } from "./shared";
 
 function parseGeminiSseBody(rawText: string): GeminiApiBody | null {

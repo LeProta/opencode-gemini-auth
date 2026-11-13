@@ -14,7 +14,7 @@ import {
 } from "./helpers";
 import { classifyQuotaResponse, retryInternals, type QuotaContext } from "./quota";
 import { isGeminiDebugEnabled, logGeminiDebugMessage } from "../debug";
-import { geminiFetch } from "../../fetch";
+import { geminiFetch } from "../fetch";
 
 const retryCooldownByKey = new Map<string, number>();
 const RETRY_IN_FLIGHT_LOG_INTERVAL_MS = 5000;

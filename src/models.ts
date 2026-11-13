@@ -1,3 +1,9 @@
+import { readCache, writeCache, type ModelCaps } from "./cache";
+import { currentVersion } from "./config";
+import { upstreamJson } from "./fetch";
+import { API, parseAvailableModels } from "./vendor/protocol.js";
+import { userAgents } from "./wire";
+
 /**
  * Maps OpenCode's built-in Google model ids onto the ids the Antigravity catalog
  * serves for the signed-in account.
@@ -38,4 +44,36 @@ export function requestedThinkingLevel(body: string | undefined): string | undef
   } catch {
     return undefined;
   }
+}
+
+/** Internal routing ids (`chat_*`, `tab_*`) upstream answers with 400. */
+export function isPublishableModelId(id: string): boolean {
+  return !!id && !/^(chat_|tab_)/.test(id);
+}
+
+/** Refreshes the cached catalog. Returns the publishable ids, or undefined when upstream gave none. */
+export async function refreshModels(accessToken: string, project: string): Promise<string[] | undefined> {
+  const ua = userAgents(await currentVersion());
+  for (const base of [API.prodBase, API.dailyBase]) {
+    try {
+      const res = await upstreamJson(`${base}${API.fetchModelsPath}`, {
+        token: accessToken,
+        ua: ua.short,
+        body: project ? { project } : {},
+        timeoutMs: 20_000,
+      });
+      if (res.status !== 200 || !res.json?.models) continue;
+      const { ids, caps } = parseAvailableModels(res.json);
+      const models = ids.filter(isPublishableModelId);
+      if (!models.length) continue;
+      const { modelsByProject } = await readCache();
+      await writeCache({
+        models,
+        modelsByProject: { ...modelsByProject, [project]: models },
+        modelCaps: caps as Record<string, ModelCaps>,
+      });
+      return models;
+    } catch {}
+  }
+  return undefined;
 }

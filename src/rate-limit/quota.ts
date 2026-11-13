@@ -2,7 +2,7 @@ import {
   CLOUDCODE_DOMAINS as CLOUDCODE_DOMAIN_LIST,
   parseRetryDelayFromMessage as parseSharedRetryDelayFromMessage,
   parseRetryDelayValue as parseSharedRetryDelayValue,
-} from "../request-helpers";
+} from "../request/helpers";
 
 interface GoogleRpcErrorInfo {
   "@type"?: string;

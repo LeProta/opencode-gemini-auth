@@ -4,7 +4,7 @@ import {
   accessTokenExpired,
   formatRefreshParts,
   parseRefreshParts,
-} from "./auth";
+} from "./refresh-parts";
 
 describe("auth helpers", () => {
   it("parses refresh parts with project and managed ids", () => {

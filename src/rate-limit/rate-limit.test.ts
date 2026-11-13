@@ -7,8 +7,8 @@ import {
   resolveRetryDelayMs,
   retryInternals,
   waitForRetryCooldown,
-} from "./retry";
-import { classifyQuotaResponse } from "./retry/quota";
+} from ".";
+import { classifyQuotaResponse } from "./quota";
 
 const originalSetTimeout = globalThis.setTimeout;
 const scheduledDelays: number[] = [];

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 
-import { getGeminiModelCapabilities } from "../model-config";
+import { getGeminiModelCapabilities } from "./model-config";
 import { isRecord, readString } from "./shared";
 
 interface GeminiFunctionCallPart {

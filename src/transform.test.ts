@@ -1,7 +1,9 @@
 import { describe, expect, it } from "bun:test";
 
-import { prepareGeminiRequest } from "../plugin/request";
-import { isPublishableModelId, toAntigravityRequest } from "./client";
+import { prepareGeminiRequest } from "./request";
+import { isPublishableModelId } from "./models";
+import { formatQuotaSummary } from "./quota";
+import { toAntigravityRequest, withThoughts } from "./transform";
 
 describe("toAntigravityRequest", () => {
   const input =
@@ -63,7 +65,6 @@ describe("isPublishableModelId", () => {
 });
 
 describe("withThoughts", () => {
-  const { withThoughts } = require("./client") as typeof import("./client");
   const tc = (model: string, request: Record<string, any> = {}) => withThoughts(model, request).generationConfig?.thinkingConfig;
 
   it("pairs includeThoughts with a level or budget, like CLIProxyAPI", () => {
@@ -81,7 +82,6 @@ describe("withThoughts", () => {
 });
 
 describe("formatQuotaSummary", () => {
-  const { formatQuotaSummary } = require("./client") as typeof import("./client");
   it("prints each pool and window with what is left and the reset", () => {
     const now = Date.UTC(2026, 10, 12, 12);
     const text = formatQuotaSummary(

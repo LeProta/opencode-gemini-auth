@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
 
-import { GEMINI_CODE_ASSIST_ENDPOINT } from "../../constants";
-import { getGeminiModelCapabilities, type GeminiThinkingMode } from "../model-config";
-import { normalizeThinkingConfig } from "../request-helpers";
+import { GEMINI_CODE_ASSIST_ENDPOINT } from "../constants";
+import { getGeminiModelCapabilities, type GeminiThinkingMode } from "./model-config";
+import { normalizeThinkingConfig } from "./helpers";
 import { normalizeRequestPayloadIdentifiers, normalizeWrappedIdentifiers } from "./identifiers";
 import {
   addThoughtSignaturesToFunctionCalls,

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "bun:test";
 
-import { parseTokenResponse, refreshAuth } from "./client";
+import { parseTokenResponse, refreshAuth } from "./auth";
 
 const realFetch = globalThis.fetch;
 afterEach(() => {
@@ -65,7 +65,7 @@ describe("refreshAuth", () => {
 
 describe("versionOverride", () => {
   it("uses a well-formed version and ignores anything else", async () => {
-    const { versionOverride } = await import("./client");
+    const { versionOverride } = await import("./config");
     expect(versionOverride("2.40.1")).toBe("2.40.1");
     expect(versionOverride(" 2.40.1 ")).toBe("2.40.1");
     expect(versionOverride(undefined)).toBeUndefined();

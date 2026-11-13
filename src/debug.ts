@@ -1,7 +1,7 @@
 import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { env } from "node:process";
-import { redact, redactString } from "./logger";
+import { redact, redactString } from "./redact";
 import { getGeminiPluginDataDir } from "./storage-paths";
 
 const MAX_BODY_PREVIEW_CHARS = 2000;

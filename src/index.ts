@@ -10,26 +10,20 @@
  */
 import { Integration, Plugin, type Credential } from "@opencode/plugin";
 
-import {
-  checkUpstreamUpdate,
-  currentVersion,
-  fetchQuotaSummary,
-  formatQuotaSummary,
-  readCache,
-  refreshAuth,
-  refreshModels,
-  resolveProject,
-  toAntigravityRequest,
-  useCacheStorage,
-} from "./antigravity/client";
-import { requestedThinkingLevel, upstreamModelFor } from "./antigravity/models";
-import { authorizeAntigravity } from "./antigravity/oauth";
+import { authorizeAntigravity, refreshAuth } from "./auth";
+import { readCache, useCacheStorage } from "./cache";
+import { currentVersion } from "./config";
+import { refreshModels, requestedThinkingLevel, upstreamModelFor } from "./models";
+import { resolveProject } from "./project";
+import { fetchQuotaSummary, formatQuotaSummary } from "./quota";
+import { toAntigravityRequest } from "./transform";
+import { checkUpstreamUpdate } from "./upstream";
 import { readBoundedText, readPrefix } from "./bounded";
 import { geminiFetch } from "./fetch";
-import { accessTokenExpired, parseRefreshParts } from "./plugin/auth";
-import { logGeminiDebugMessage, startGeminiDebugRequest, type GeminiDebugContext } from "./plugin/debug";
-import { isGenerativeLanguageRequest, prepareGeminiRequest, transformGeminiResponse } from "./plugin/request";
-import { parseRetryDelayFromMessage } from "./plugin/request-helpers";
+import { accessTokenExpired, parseRefreshParts } from "./refresh-parts";
+import { logGeminiDebugMessage, startGeminiDebugRequest, type GeminiDebugContext } from "./debug";
+import { isGenerativeLanguageRequest, prepareGeminiRequest, transformGeminiResponse } from "./request";
+import { parseRetryDelayFromMessage } from "./request/helpers";
 import {
   buildRetryThrottleKey,
   classifyQuotaResponse,
@@ -42,8 +36,8 @@ import {
   waitForRetryCooldown,
   type GeminiRetryDecision,
   type QuotaContext,
-} from "./plugin/retry";
-import type { OAuthAuthDetails, TokenExchangeResult } from "./plugin/types";
+} from "./rate-limit";
+import type { OAuthAuthDetails, TokenExchangeResult } from "./types";
 
 const GOOGLE_ID = "google";
 const METHOD_ID = Integration.MethodID.make("antigravity");

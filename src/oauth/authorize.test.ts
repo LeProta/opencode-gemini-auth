@@ -1,6 +1,6 @@
 import { describe, expect, it, mock } from "bun:test";
-import { createOAuthAuthorizeMethod, type OAuthAuthorization } from "./oauth-authorize";
-import type { TokenExchangeResult } from "./types";
+import { createOAuthAuthorizeMethod, type OAuthAuthorization } from "./authorize";
+import type { TokenExchangeResult } from "../types";
 import {
   createOAuthCallbackRequestHandler,
   startOAuthListener,

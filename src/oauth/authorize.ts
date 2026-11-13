@@ -1,12 +1,12 @@
 import { spawn } from "node:child_process";
 
-import { isGeminiDebugEnabled, logGeminiDebugMessage } from "./debug";
+import { isGeminiDebugEnabled, logGeminiDebugMessage } from "../debug";
 import {
   startOAuthListener,
   type OAuthCallbackResponse,
   type OAuthListener,
 } from "./server";
-import type { OAuthAuthDetails, TokenExchangeResult } from "./types";
+import type { OAuthAuthDetails, TokenExchangeResult } from "../types";
 
 export interface OAuthAuthorization {
   url: string;

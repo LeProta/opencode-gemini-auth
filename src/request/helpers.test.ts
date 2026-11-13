@@ -5,7 +5,7 @@ import {
   extractUsageMetadata,
   normalizeThinkingConfig,
   parseGeminiApiBody,
-} from "./request-helpers";
+} from "./helpers";
 
 describe("enhanceGeminiErrorResponse", () => {
   it("adds retry hint and rate-limit message for 429 rate limits", () => {

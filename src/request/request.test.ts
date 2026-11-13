@@ -6,7 +6,7 @@ import {
   prepareGeminiRequest,
   repairGeminiToolPairs,
   transformGeminiResponse,
-} from "./request";
+} from ".";
 
 describe("request helpers", () => {
   it("detects generativelanguage URLs", () => {

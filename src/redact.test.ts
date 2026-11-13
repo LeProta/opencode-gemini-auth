@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { closeLogger, initLogger, log, redact } from "./logger";
+import { closeLogger, initLogger, log, redact } from "./redact";
 
 describe("logger", () => {
   const createdDirs: string[] = [];

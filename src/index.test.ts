@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 
-import { setup } from "./plugin-v2";
+import { setup } from ".";
 
 process.env.OPENCODE_ANTIGRAVITY_UPDATE_CHECK = "0";
 
@@ -39,10 +39,17 @@ function fakeContext(credential: unknown) {
   const ctx = {
     storage: { get: async (key: string) => store.get(key), set: async (key: string, value: unknown) => void store.set(key, value) },
     integration: {
-      transform: async (cb: any) => void (transforms.integration = cb),
+      transform: async (cb: any) => {
+        transforms.integration = cb;
+      },
       connection: { active: async () => (credential ? { id: "c1" } : undefined), resolve: async () => credential },
     },
-    provider: { transform: async (cb: any) => void (transforms.provider = cb), reload: async () => {} },
+    provider: {
+      transform: async (cb: any) => {
+        transforms.provider = cb;
+      },
+      reload: async () => {},
+    },
     session: { hook: async (name: string, cb: any) => void hooks.set(name, cb) },
   };
   return { ctx: ctx as any, transforms, hooks };
