@@ -67,7 +67,8 @@ let writes: Promise<void> = Promise.resolve();
 export function writeCache(patch: AntigravityCache): Promise<void> {
   // Chained on the memo and on the previous write: two writes started together
   // used to read the same snapshot, and the second one dropped the first one's patch.
-  const merged = (memo = readCache().then((current) => ({ ...current, ...patch })));
+  const merged = readCache().then((current) => ({ ...current, ...patch }));
+  memo = merged;
   writes = writes.then(async () => {
     const next = await merged;
     try {
