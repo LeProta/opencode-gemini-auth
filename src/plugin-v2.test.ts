@@ -120,6 +120,48 @@ describe("Google OAuth on the built-in provider", () => {
     expect(envelope.request.generationConfig.thinkingConfig).toEqual({ includeThoughts: true, thinkingLevel: "low" });
   });
 
+  it("keeps using the token refreshed after a 401 on the next request", async () => {
+    const credential = { ...subscription, refresh: "rt-401|proj-1", access: "revoked-token" };
+    const { ctx, hooks } = fakeContext(credential);
+    await setup(ctx);
+    const offline = globalThis.fetch;
+    const sentTokens: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input instanceof Request ? input.url : input);
+      if (url.includes("oauth2.googleapis.com/token")) {
+        return new Response('{"access_token":"fresh-token","expires_in":3600}', { status: 200 });
+      }
+      if (url.includes("cloudcode-pa.googleapis.com")) {
+        // Only the replayed generate call; the background catalog refresh also lands here.
+        if (url.includes(":generateContent")) sentTokens.push(new Headers(init?.headers).get("authorization") ?? "");
+        return new Response('{"response":{"candidates":[]}}', { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return new Response("offline", { status: 503 });
+    }) as typeof fetch;
+    try {
+      const request = () => ({
+        model: { id: "gemini-3-flash" },
+        request: new Request("https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash:generateContent", {
+          method: "POST",
+          body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "hi" }] }] }),
+        }),
+      });
+      const first = request();
+      await hooks.get("http.request")!(first);
+      expect(first.request.headers.get("authorization")).toBe("Bearer revoked-token");
+      const response = { request: first.request, response: new Response("unauthorized", { status: 401 }), model: first.model };
+      await hooks.get("http.response")!(response);
+      expect(response.response.status).toBe(200);
+      expect(sentTokens).toEqual(["Bearer fresh-token"]);
+
+      const second = request();
+      await hooks.get("http.request")!(second);
+      expect(second.request.headers.get("authorization")).toBe("Bearer fresh-token");
+    } finally {
+      globalThis.fetch = offline;
+    }
+  });
+
   it("explains instead of sending a model the subscription lacks", async () => {
     const { ctx, hooks } = fakeContext(subscription);
     await setup(ctx);

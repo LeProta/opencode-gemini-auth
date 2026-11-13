@@ -60,6 +60,7 @@ interface Snapshot {
   url: string;
   init: RequestInit;
   auth: OAuthAuthDetails;
+  authKey: string;
   throttleKey: string;
   signal: AbortSignal;
   replayed: boolean;
@@ -104,8 +105,14 @@ async function activeCredential(ctx: V2Context): Promise<Credential.OAuth | unde
   return isOurCredential(credential) ? credential : undefined;
 }
 
+interface ActiveSession {
+  auth: OAuthAuthDetails;
+  /** Refresh token of the credential OpenCode stores; keys the plugin-side fallback. */
+  key: string;
+}
+
 /** The subscription login when it is Google's active connection, refreshed if needed. */
-async function activeAuth(ctx: V2Context): Promise<OAuthAuthDetails | undefined> {
+async function activeSession(ctx: V2Context): Promise<ActiveSession | undefined> {
   const credential = await activeCredential(ctx);
   if (!credential) return undefined;
   const auth: OAuthAuthDetails = {
@@ -114,17 +121,26 @@ async function activeAuth(ctx: V2Context): Promise<OAuthAuthDetails | undefined>
     access: credential.access,
     expires: credential.expires,
   };
-  if (!accessTokenExpired(auth)) return auth;
+  const key = parseRefreshParts(auth.refresh).refreshToken;
+
+  // A token the plugin refreshed (401 replay, or an expired hand-over) wins until
+  // OpenCode stores a newer credential of its own.
+  const memo = fallbackAuth.get(key);
+  if (memo && !accessTokenExpired(memo) && (memo.expires ?? 0) > (auth.expires ?? 0)) return { auth: memo, key };
+  if (memo) fallbackAuth.delete(key);
+  if (!accessTokenExpired(auth)) return { auth, key };
 
   // OpenCode refreshes and stores the credential through the method's `refresh`;
   // this only covers a credential handed over already expired.
-  const key = parseRefreshParts(auth.refresh).refreshToken;
-  const memo = fallbackAuth.get(key);
-  if (memo && !accessTokenExpired(memo)) return memo;
   logGeminiDebugMessage("Google OAuth: OpenCode handed over an expired credential, refreshing in the plugin");
-  return refreshAuth(auth, async (next) => {
-    fallbackAuth.set(key, next);
+  const next = await refreshAuth(auth, async (refreshed) => {
+    fallbackAuth.set(key, refreshed);
   });
+  return { auth: next, key };
+}
+
+async function activeAuth(ctx: V2Context): Promise<OAuthAuthDetails | undefined> {
+  return (await activeSession(ctx))?.auth;
 }
 
 async function projectFor(auth: OAuthAuthDetails): Promise<string> {
@@ -255,8 +271,9 @@ export async function setup(ctx: V2Context): Promise<Plugin.Cleanup> {
     "http.request",
     async (event) => {
       if (!isGenerativeLanguageRequest(event.request)) return;
-      const auth = await activeAuth(ctx);
-      if (!auth?.access) return; // API key connection: leave the request alone
+      const session = await activeSession(ctx);
+      const auth = session?.auth;
+      if (!session || !auth?.access) return; // API key connection: leave the request alone
       const projectId = await projectFor(auth);
       if (!catalog) await syncModels(auth).catch(() => {});
       else if (!modelsSynced) void syncModels(auth).catch(() => {});
@@ -305,6 +322,7 @@ export async function setup(ctx: V2Context): Promise<Plugin.Cleanup> {
         url: target.url,
         init: target.init,
         auth,
+        authKey: session.key,
         throttleKey,
         signal: original.signal,
         replayed: false,
@@ -327,7 +345,7 @@ export async function setup(ctx: V2Context): Promise<Plugin.Cleanup> {
         snapshot.replayed = true;
         await event.response.body?.cancel().catch(() => {});
         const next = await refreshAuth(snapshot.auth, async (refreshed) => {
-          fallbackAuth.set(parseRefreshParts(refreshed.refresh).refreshToken, refreshed);
+          fallbackAuth.set(snapshot.authKey, refreshed);
         });
         const headers = new Headers(snapshot.init.headers);
         headers.set("Authorization", `Bearer ${next.access}`);
