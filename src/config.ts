@@ -27,7 +27,7 @@ export function versionOverride(raw = process.env[VERSION_OVERRIDE_ENV]): string
   if (VERSION_PATTERN.test(value)) return value;
   if (!overrideWarned) {
     overrideWarned = true;
-    console.error(`[Google OAuth] ${VERSION_OVERRIDE_ENV} must look like 2.31.2; using the live Antigravity version instead.`);
+    console.error(`[leprota.google-auth] ${VERSION_OVERRIDE_ENV} must look like 2.31.2; using the live Antigravity version instead.`);
   }
   return undefined;
 }

@@ -64,7 +64,7 @@ export function createOAuthAuthorizeMethod(options: OAuthAuthorizeMethodOptions)
       } catch (error) {
         if (isGeminiDebugEnabled()) {
           const message = error instanceof Error ? error.message : String(error);
-          console.warn(`[Google OAuth] Project resolution skipped: ${message}`);
+          console.warn(`[leprota.google-auth] Project resolution skipped: ${message}`);
         }
         return result;
       }

@@ -164,7 +164,7 @@ async function quotaReport(ctx: V2Context): Promise<{ ok: boolean; text: string 
   try {
     const auth = await activeAuth(ctx);
     if (!auth?.access) {
-      return { ok: false, text: "Google quota: connect Google with \"OAuth with Google (AI Pro/Ultra)\" first." };
+      return { ok: false, text: "Google quota: connect Google with \"Google AI Pro/Ultra\" first." };
     }
     const summary = await fetchQuotaSummary(auth.access, await projectFor(auth));
     return summary
@@ -177,7 +177,7 @@ async function quotaReport(ctx: V2Context): Promise<{ ok: boolean; text: string 
 
 export async function setup(ctx: V2Context): Promise<Plugin.Cleanup> {
   if (ctx.storage) useCacheStorage(ctx.storage);
-  void checkUpstreamUpdate((message) => console.warn(`[Google OAuth] ${message}`));
+  void checkUpstreamUpdate((message) => console.warn(`[leprota.google-auth] ${message}`));
 
   const requests = new WeakMap<Request, Snapshot>();
   const recentFailures = new Map<string, RecentFailure>();
@@ -203,7 +203,7 @@ export async function setup(ctx: V2Context): Promise<Plugin.Cleanup> {
   await ctx.integration.transform((draft) => {
     draft.method.update({
       integrationID: GOOGLE_ID,
-      method: { id: METHOD_ID, type: "oauth", label: "OAuth with Google (AI Pro/Ultra)" },
+      method: { id: METHOD_ID, type: "oauth", label: "Google AI Pro/Ultra" },
       authorize: async () => {
         const authorization = await authorizeAntigravity();
         return authorization.method === "auto"
@@ -486,7 +486,7 @@ export async function setup(ctx: V2Context): Promise<Plugin.Cleanup> {
 }
 
 export default Plugin.define({
-  // Kept from the original plugin so its V2 storage (cache) carries over.
-  id: "Gemini OAuth Plugin",
+  // Named like ex-machina.anthropic-auth. The cache it keeps is rebuilt on first use.
+  id: "leprota.google-auth",
   setup,
 });
