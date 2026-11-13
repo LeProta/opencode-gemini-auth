@@ -32,12 +32,15 @@ the minor for compatible features, and the patch for fixes or documentation upda
 Each plugin advances independently; matching numbers do not imply matching features.
 Fork versions are independent of upstream versions and client versions sent to APIs.
 
-Version `2.1.2` documents this shared convention without runtime changes.
+Version `2.1.3` fixes: classifying a 429/5xx answer over 1 MB could hold the response
+forever; a sign-in left unfinished kept the callback port for 5 minutes; reasoning was
+turned off when the request asked for it without a level or budget; two cache writes
+made together lost one; a response arriving after a plugin reload stayed wrapped.
 
 ## Install
 
 ```bash
-opencode plugin add github:LeProta/opencode-gemini-auth#v2.1.2
+opencode plugin add github:LeProta/opencode-gemini-auth#v2.1.3
 ```
 
 Pin a tag: `github:LeProta/opencode-gemini-auth` alone follows `main`. To update, change
@@ -122,6 +125,10 @@ bun install
 bun run check     # tsc + Biome lint + bun test
 bun run bundle    # rebuild dist/ (commit it)
 ```
+
+Run them with the Bun that OpenCode embeds (see Version support): with Bun 1.3.14 on
+Windows `bun test` hangs in `auth.test.ts`. Tests use a temporary `OPENCODE_DATA_DIR`
+(`src/test-preload.ts`), never your real plugin cache.
 
 ## Publishing
 

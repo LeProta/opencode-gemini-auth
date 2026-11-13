@@ -34,7 +34,7 @@ async function readBoundedText(body, limit, label, signal) {
       if (done) break;
       total += value.byteLength;
       if (total > limit) {
-        await reader.cancel().catch(() => {
+        void reader.cancel().catch(() => {
         });
         throw new BodyLimitError(label, limit);
       }
@@ -60,7 +60,7 @@ async function readPrefix(body, maxBytes) {
       total += value.byteLength;
     }
   } finally {
-    await reader.cancel().catch(() => {
+    void reader.cancel().catch(() => {
     });
   }
   const bytes = new Uint8Array(total);
@@ -74,7 +74,7 @@ async function readPrefix(body, maxBytes) {
 async function readResponseText(response, limit, label, signal) {
   const declared = contentLength(response.headers);
   if (declared !== void 0 && declared > limit) {
-    await response.body?.cancel().catch(() => {
+    void response.body?.cancel().catch(() => {
     });
     throw new BodyLimitError(label, limit);
   }
@@ -143,18 +143,23 @@ function readCache() {
   memo ??= loadCache();
   return memo;
 }
-async function writeCache(patch) {
-  const next = { ...await readCache(), ...patch };
-  memo = Promise.resolve(next);
-  try {
-    if (storage) {
-      await storage.set(STORAGE_KEY, next);
-      return;
+var writes = Promise.resolve();
+function writeCache(patch) {
+  const merged = readCache().then((current) => ({ ...current, ...patch }));
+  memo = merged;
+  writes = writes.then(async () => {
+    const next = await merged;
+    try {
+      if (storage) {
+        await storage.set(STORAGE_KEY, next);
+        return;
+      }
+      await mkdir(getGeminiPluginDataDir(), { recursive: true });
+      await writeFile(cachePath(), JSON.stringify(next, null, 2));
+    } catch {
     }
-    await mkdir(getGeminiPluginDataDir(), { recursive: true });
-    await writeFile(cachePath(), JSON.stringify(next, null, 2));
-  } catch {
-  }
+  });
+  return writes;
 }
 
 // src/fetch.ts
@@ -1134,6 +1139,7 @@ function createOAuthAuthorizeMethod(options) {
   const { authorizeFn, exchangeFn, resolveProjectContextFn } = options;
   const startListenerFn = options.startListenerFn ?? startOAuthListener;
   const openBrowser = options.openBrowser ?? openBrowserUrl;
+  let activeListener = null;
   return async () => {
     const maybeHydrateProjectId = async (result) => {
       if (result.type !== "success" || !result.access || !resolveProjectContextFn) {
@@ -1259,11 +1265,16 @@ function createOAuthAuthorizeMethod(options) {
     let listener = null;
     if (!isHeadless) {
       try {
+        const superseded = activeListener;
+        activeListener = null;
+        await superseded?.close().catch(() => {
+        });
         listener = await startListenerFn({
           timeoutMs: options.timeoutMs,
           redirectUri: options.redirectUri,
           onCallback: handleCallbackUrl
         });
+        activeListener = listener;
       } catch (error) {
         const detail = error instanceof Error ? ` (${error.message})` : "";
         console.log(
@@ -1296,6 +1307,7 @@ function createOAuthAuthorizeMethod(options) {
               error: error instanceof Error ? error.message : "Unknown error"
             };
           } finally {
+            if (activeListener === listener) activeListener = null;
             try {
               await listener?.close();
             } catch {
@@ -1825,8 +1837,8 @@ function normalizeThinkingConfig(config, options) {
   }
   const budgetEnabled = effectiveBudget !== void 0 && (effectiveBudget > 0 || effectiveBudget === -1);
   const levelEnabled = effectiveLevel !== void 0 && effectiveLevel !== "none" && effectiveLevel !== "off";
-  const thinkingEnabled = budgetEnabled || levelEnabled;
-  const finalIncludeThoughts = thinkingEnabled ? includeThoughts ?? false : false;
+  const thinkingOff = (effectiveBudget !== void 0 || effectiveLevel !== void 0) && !budgetEnabled && !levelEnabled;
+  const finalIncludeThoughts = thinkingOff ? false : includeThoughts;
   const normalized = {};
   if (effectiveBudget !== void 0) {
     normalized.thinkingBudget = effectiveBudget;
@@ -1834,7 +1846,9 @@ function normalizeThinkingConfig(config, options) {
   if (effectiveLevel !== void 0) {
     normalized.thinkingLevel = effectiveLevel;
   }
-  normalized.includeThoughts = finalIncludeThoughts;
+  if (finalIncludeThoughts !== void 0) {
+    normalized.includeThoughts = finalIncludeThoughts;
+  }
   return normalized;
 }
 
@@ -3366,6 +3380,7 @@ var DEBUG_EXCERPT_BYTES = 4e3;
 var catalogs = /* @__PURE__ */ new Map();
 var projectByToken = /* @__PURE__ */ new Map();
 var fallbackAuth = /* @__PURE__ */ new Map();
+var requests = /* @__PURE__ */ new WeakMap();
 function toCredential(result) {
   if (result.type !== "success") throw new Error(result.error);
   const { projectId } = parseRefreshParts(result.refresh);
@@ -3439,7 +3454,6 @@ async function quotaReport(ctx) {
 async function setup(ctx) {
   if (ctx.storage) useCacheStorage(ctx.storage);
   void checkUpstreamUpdate((message) => console.warn(`[leprota.google-auth] ${message}`));
-  const requests = /* @__PURE__ */ new WeakMap();
   const recentFailures = /* @__PURE__ */ new Map();
   const eventAbort = new AbortController();
   let oauthActive = false;
@@ -3596,11 +3610,11 @@ async function setup(ctx) {
     "http.response",
     async (event) => {
       const snapshot = requests.get(event.request);
-      if (!snapshot || disposed) return;
+      if (!snapshot) return;
       requests.delete(event.request);
       if (event.response.status === 401 && !snapshot.replayed) {
         snapshot.replayed = true;
-        await event.response.body?.cancel().catch(() => {
+        void event.response.body?.cancel().catch(() => {
         });
         const next = await refreshAuth(snapshot.auth, async (refreshed) => {
           fallbackAuth.set(snapshot.authKey, refreshed);
