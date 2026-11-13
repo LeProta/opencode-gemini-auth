@@ -62,3 +62,16 @@ describe("refreshAuth", () => {
     expect(message).not.toContain("secret-ish");
   });
 });
+
+describe("versionOverride", () => {
+  it("uses a well-formed version and ignores anything else", async () => {
+    const { versionOverride } = await import("./client");
+    expect(versionOverride("2.40.1")).toBe("2.40.1");
+    expect(versionOverride(" 2.40.1 ")).toBe("2.40.1");
+    expect(versionOverride(undefined)).toBeUndefined();
+    expect(versionOverride("")).toBeUndefined();
+    expect(versionOverride("2.40")).toBeUndefined();
+    expect(versionOverride("02.40.1")).toBeUndefined();
+    expect(versionOverride("2.40.1; rm -rf")).toBeUndefined();
+  });
+});

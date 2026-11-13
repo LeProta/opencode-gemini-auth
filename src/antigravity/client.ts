@@ -122,7 +122,25 @@ export function currentVersion(): Promise<string> {
   return versionMemo.value;
 }
 
+export const VERSION_OVERRIDE_ENV = "OPENCODE_ANTIGRAVITY_VERSION";
+const VERSION_PATTERN = /^(0|[1-9]\d{0,5})\.(0|[1-9]\d{0,5})\.(0|[1-9]\d{0,5})$/;
+let overrideWarned = false;
+
+/** A valid override wins over the manifest; a malformed one is ignored (and said so once). */
+export function versionOverride(raw = process.env[VERSION_OVERRIDE_ENV]): string | undefined {
+  if (raw === undefined || raw.trim() === "") return undefined;
+  const value = raw.trim();
+  if (VERSION_PATTERN.test(value)) return value;
+  if (!overrideWarned) {
+    overrideWarned = true;
+    console.error(`[Google OAuth] ${VERSION_OVERRIDE_ENV} must look like 2.31.2; using the live Antigravity version instead.`);
+  }
+  return undefined;
+}
+
 async function loadVersion(): Promise<string> {
+  const forced = versionOverride();
+  if (forced) return forced;
   const now = Date.now();
   const cache = await readCache();
   const cacheAge = now - (cache.versionFetchedAt ?? 0);
