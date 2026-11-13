@@ -447,6 +447,8 @@ export function toAntigravityRequest(
   const headers = new Headers(init.headers);
   headers.set("User-Agent", userAgents(version).short);
   headers.delete("x-activity-request-id"); // Gemini CLI fingerprint, not sent by Antigravity
+  // The body was rewritten: these described the caller's body, not ours.
+  for (const name of STALE_BODY_HEADERS) headers.delete(name);
 
   const action = url.match(/v1internal:(\w+)/)?.[1];
   let body = init.body;
@@ -457,10 +459,24 @@ export function toAntigravityRequest(
     body = JSON.stringify(antigravityEnvelope(wrapped.model, project, withThoughts(wrapped.model, request)));
   }
 
-  return {
-    url: url.replace(GEMINI_CODE_ASSIST_ENDPOINT, API.dailyBase),
-    init: { ...init, headers, body },
-  };
+  const target = url.replace(GEMINI_CODE_ASSIST_ENDPOINT, API.dailyBase);
+  if (!isTrustedGoogleUrl(target)) {
+    throw new Error("Refusing to send Google OAuth credentials to an untrusted origin");
+  }
+  return { url: target, init: { ...init, headers, body, redirect: "error" } };
+}
+
+const STALE_BODY_HEADERS = ["content-length", "content-encoding", "content-md5", "content-digest", "digest", "etag"];
+const TRUSTED_ORIGINS = new Set([API.dailyBase, API.prodBase]);
+
+/** The bearer token only ever goes to the two Cloud Code hosts. */
+export function isTrustedGoogleUrl(input: string): boolean {
+  try {
+    const url = new URL(input);
+    return url.username === "" && url.password === "" && TRUSTED_ORIGINS.has(url.origin);
+  } catch {
+    return false;
+  }
 }
 
 // ---------------------------------------------------------------------------

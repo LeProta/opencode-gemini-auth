@@ -24,6 +24,7 @@ import {
 } from "./antigravity/client";
 import { requestedThinkingLevel, upstreamModelFor } from "./antigravity/models";
 import { authorizeAntigravity } from "./antigravity/oauth";
+import { readBoundedText, readPrefix } from "./bounded";
 import { geminiFetch } from "./fetch";
 import { accessTokenExpired, parseRefreshParts } from "./plugin/auth";
 import { logGeminiDebugMessage, startGeminiDebugRequest, type GeminiDebugContext } from "./plugin/debug";
@@ -49,6 +50,8 @@ const METHOD_ID = Integration.MethodID.make("antigravity");
 const MARKER = "opencode.provider.google-oauth";
 const QUOTA_TOOL_NAME = "google_quota";
 const RECENT_FAILURE_TTL_MS = 30_000;
+const MAX_REQUEST_BODY_BYTES = 128 * 1024 * 1024; // inline images included; Anthropic plugin's limit
+const DEBUG_EXCERPT_BYTES = 4000;
 
 type V2Context = Pick<Plugin.Context, "provider" | "integration" | "session"> &
   Partial<Pick<Plugin.Context, "event" | "storage" | "tool" | "command">>;
@@ -280,7 +283,10 @@ export async function setup(ctx: V2Context): Promise<Plugin.Cleanup> {
       modelsSynced = true;
 
       const original = event.request;
-      const body = original.method === "GET" || original.method === "HEAD" ? undefined : await original.clone().text();
+      const body =
+        original.method === "GET" || original.method === "HEAD"
+          ? undefined
+          : await readBoundedText(original.clone().body, MAX_REQUEST_BODY_BYTES, "Google request body");
       const modelID = original.url.match(/\/models\/([^:]+):/)?.[1];
       const upstream = modelID && catalog ? upstreamModelFor(modelID, catalog, requestedThinkingLevel(body)) : modelID;
       if (!upstream) {
@@ -371,10 +377,8 @@ export async function setup(ctx: V2Context): Promise<Plugin.Cleanup> {
 
       if (snapshot.debugContext) {
         // Debug only: tee the raw upstream stream into the log (thought parts included).
-        void event.response
-          .clone()
-          .text()
-          .then((raw) => logGeminiDebugMessage(`Google raw response: ${raw.slice(0, 4000)}`))
+        void readPrefix(event.response.clone().body, DEBUG_EXCERPT_BYTES)
+          .then((raw) => logGeminiDebugMessage(`Google raw response: ${raw}`))
           .catch(() => {});
       }
       event.response = await transformGeminiResponse(

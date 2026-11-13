@@ -42,6 +42,31 @@ export async function readBoundedText(
   }
 }
 
+/** First `maxBytes` of a body (debug excerpts); the rest is cancelled, never buffered. */
+export async function readPrefix(body: ReadableStream<Uint8Array> | null, maxBytes: number): Promise<string> {
+  if (!body) return "";
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (total < maxBytes) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      total += value.byteLength;
+    }
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(bytes.subarray(0, maxBytes));
+}
+
 /** Reads a Response body with both the declared and the actual size checked. */
 export async function readResponseText(response: Response, limit: number, label: string): Promise<string> {
   const declared = contentLength(response.headers);
