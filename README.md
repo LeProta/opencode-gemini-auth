@@ -1,9 +1,10 @@
 # Google subscription OAuth for OpenCode
 
 Use your **Google AI Pro / Ultra** subscription with OpenCode's built-in **Google**
-provider, the way the Claude subscription plugins do for Anthropic: same provider,
-same model ids (`google/gemini-3.8-flash`, `google/gemini-2.5-pro`, …), same effort
-variants, but signed in with Google OAuth instead of an API key.
+provider, the way [ex-machina/opencode-anthropic-auth](https://github.com/ex-machina-co/opencode-anthropic-auth)
+does for Claude Pro/Max: same provider, same model ids (`google/gemini-3.8-flash`,
+`google/gemini-2.5-pro`, …), same effort variants, signed in with Google OAuth instead
+of an API key.
 
 Requests go through the Antigravity (Cloud Code) surface the Antigravity app uses, so
 they draw on the subscription quota, not on API credit.
@@ -13,18 +14,26 @@ they draw on the subscription quota, not on API credit.
 > does not sanction it, may restrict the account, or may change the surface at any time.
 > Use at your own discretion; an API key is the low-risk option.
 
-Requires **OpenCode V2** (the plugin ships only the V2 `./server` entry point).
+## Version support
+
+| Component | Verified with |
+|-----------|---------------|
+| OpenCode  | v2 plugin API (`plugins` key), desktop/CLI 2.2.7 |
+| Bun       | 1.4.4 (the runtime embedded in OpenCode 2.2.7) |
+| Node      | imports cleanly (`bun run smoke:node-import`) |
+
+OpenCode v1 (`plugin` key) is not supported.
 
 ## Install
 
 ```bash
-opencode plugin add github:LeProta/opencode-gemini-auth
+opencode plugin add github:LeProta/opencode-gemini-auth#v2.1.0
 ```
 
-or, for a local checkout, `"plugins": ["file:///path/to/opencode-gemini-auth"]` in `opencode.json`.
+Pin a tag: `github:LeProta/opencode-gemini-auth` alone follows `main`. To update, change
+the tag (or run `opencode plugin update`); to roll back, install the previous tag.
 
-`dist/` is committed, so nothing needs building to install. After changing the code, run
-`bun run bundle` (or `npx tsup`) and commit `dist/`.
+`dist/` is committed because OpenCode installs GitHub plugins without building them.
 
 ## Sign in
 
@@ -32,54 +41,83 @@ or, for a local checkout, `"plugins": ["file:///path/to/opencode-gemini-auth"]` 
 opencode auth login google --method antigravity
 ```
 
-or **Google → OAuth with Google (AI Pro/Ultra)** in `/connect`. The browser callback
-listens on `localhost:51121` (fixed by Google for this client); in a headless shell you
-can paste the redirect URL or the code instead.
+or **Google → Google AI Pro/Ultra** in `/connect`. The browser callback listens on
+`localhost:51121` (fixed by Google for this client). In a headless shell, paste the
+**full** redirected URL from the address bar: it carries the `state` that ties it to
+this sign-in, so a bare code is refused.
 
-## What it does while the OAuth login is Google's active connection
+## What it does while this login is Google's active connection
 
 - **Models**: the Google models your subscription serves stay listed under their usual
-  ids and names; the others (e.g. Gemini 4 Argon, 3.1 Pro preview on a Pro account) are
-  hidden. The list comes from your account's catalog and refreshes live.
-- **Effort variants**: OpenCode's native `low` / `medium` / `high` variants pick the
-  matching upstream id (`gemini-3.8-flash` + `low` → `gemini-3.8-flash-low`); without a
-  variant the strongest effort is used.
+  ids; the others are hidden. The list is your account's catalog (kept per account, so
+  switching accounts switches the list) and refreshes live.
+- **Effort variants**: OpenCode's `low` / `medium` / `high` variants pick the matching
+  upstream id (`gemini-3.8-flash` + `low` → `gemini-3.8-flash-low`); without a variant
+  the strongest effort is used.
 - **Reasoning** is streamed and shown by OpenCode.
 - **Prices** are zeroed (usage is covered by the subscription).
 - **Retries**: 429 / 503 honour Google's `RetryInfo`, wait out cooldowns and stop on
-  terminal quota.
+  terminal quota or capacity errors. Retry state is kept per session, agent and model.
 - **Quota**: `/gquota` (and the `google_quota` tool) shows the weekly and 5-hour pools.
+- **Tokens**: OpenCode refreshes the access token through the plugin; a token revoked
+  early (401) is refreshed once, the request replayed, and the new token reused.
 
 With an API key connected instead, the plugin leaves the Google provider alone.
 
-## Keeping up with Google
+## Configuration
 
-The Antigravity client version (User-Agent) is read live from Google's updater
-manifest. The rest of the wire format lives in `src/antigravity/wire.ts`, mirrored from
+| Variable | Effect |
+|----------|--------|
+| `OPENCODE_ANTIGRAVITY_VERSION` | Forces the Antigravity client version reported upstream (`x.y.z`). A malformed value is ignored with an error line. Default: read live from Google's updater manifest (cached 6 h), then a bundled fallback. |
+| `OPENCODE_ANTIGRAVITY_UPDATE_CHECK=0` | Turns off the daily CLIProxyAPI change check. |
+| `OPENCODE_GEMINI_MAX_RETRY_MS` | Longest server-requested retry delay to wait for. |
+| `OPENCODE_GEMINI_AUTH_PROXY` | HTTP proxy for the plugin's own requests. |
+| `OPENCODE_GEMINI_DEBUG=1` | Logs each request (tokens redacted), the model mapping, the final `generationConfig` and a 4 KB raw response excerpt to the plugin's log directory. Prompts and answers are **not** redacted: keep it off by default. |
+
+## How it works
+
+`src/index.ts` registers the `antigravity` OAuth method on OpenCode's `google`
+integration and three session hooks on the Google provider:
+
+1. **http.request** — maps the model id on the account's catalog, rewrites the Gemini
+   API call into an Antigravity envelope (`src/transform.ts`, `src/wire.ts`), and sends
+   it to `daily-cloudcode-pa.googleapis.com` only (any other origin is refused,
+   redirects too).
+2. **http.response** — 401 replay, quota classification, then unwraps the envelope back
+   into Gemini API responses; SSE is transformed at the consumer's pace with bounded
+   buffers.
+3. **retry** — OpenCode's retry decision, using Google's delays.
+
+Every network read is size-bounded (`src/bounded.ts`); token responses are validated
+before they reach OpenCode's credential store.
+
+### Keeping up with Google
+
+The client version is read live from Google's updater manifest. The rest of the wire
+format lives in `src/wire.ts`, mirrored from
 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI); the last reviewed commit of
-each mirrored file is in `src/antigravity/upstream.ts`. At startup (at most once a day)
-the plugin checks GitHub and warns when one of them changed. It never downloads or runs
-code itself.
+each mirrored file is in `src/upstream.ts`. At startup (at most once a day) the plugin
+checks GitHub and warns when one of them changed. It never downloads or runs code.
 
 ```bash
-npm run check:cliproxy               # unreviewed commits, with diff links
-npm run check:cliproxy -- --accept   # after porting them into wire.ts and testing
+bun run check:cliproxy               # unreviewed commits, with diff links
+bun run check:cliproxy -- --accept   # after porting them into src/wire.ts and testing
 ```
-
-Set `OPENCODE_ANTIGRAVITY_UPDATE_CHECK=0` to turn the check off.
-
-## Debugging
-
-`OPENCODE_GEMINI_DEBUG=1` logs each request (redacted), the model mapping, the final
-`generationConfig` and a raw response excerpt to the plugin's log directory.
 
 ## Development
 
 ```bash
-bun test ./src/antigravity/models.test.ts   # run test files one by one on Windows
-npx tsc --noEmit -p .
-npx tsup
+bun install
+bun run check     # tsc + Biome lint + bun test
+bun run bundle    # rebuild dist/ (commit it)
 ```
+
+## Publishing
+
+Bump `version` in `package.json`, `bun run check && bun run bundle`, commit `dist/`, tag
+`vX.Y.Z`, then push the **tag first** and `main` second. The release workflow publishes
+to npm when `main` brings a new version whose tag does not exist yet (and fails without
+an `NPM_TOKEN` secret); with the tag already pushed it skips npm.
 
 Credits: request handling started from
 [opencode-gemini-auth](https://github.com/jenslys/opencode-gemini-auth); stable
