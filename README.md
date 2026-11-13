@@ -24,10 +24,20 @@ they draw on the subscription quota, not on API credit.
 
 OpenCode v1 (`plugin` key) is not supported.
 
+## Versioning
+
+Both LeProta OAuth plugins use `MAJOR.MINOR.PATCH` in `package.json` and
+`vMAJOR.MINOR.PATCH` for GitHub tags. Increment the major for incompatible changes,
+the minor for compatible features, and the patch for fixes or documentation updates.
+Each plugin advances independently; matching numbers do not imply matching features.
+Fork versions are independent of upstream versions and client versions sent to APIs.
+
+Version `2.1.2` documents this shared convention without runtime changes.
+
 ## Install
 
 ```bash
-opencode plugin add github:LeProta/opencode-gemini-auth#v2.1.1
+opencode plugin add github:LeProta/opencode-gemini-auth#v2.1.2
 ```
 
 Pin a tag: `github:LeProta/opencode-gemini-auth` alone follows `main`. To update, change
