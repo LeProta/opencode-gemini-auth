@@ -98,23 +98,15 @@ export function createOAuthAuthorizeMethod(options: OAuthAuthorizeMethodOptions)
         };
       }
 
-      const callbackError = callbackUrl.searchParams.get("error");
-      const callbackErrorDescription = callbackUrl.searchParams.get("error_description");
-      if (callbackError) {
-        const errorMessage = callbackErrorDescription || callbackError;
-        settled = true;
-        finalResult = { type: "failed", error: errorMessage };
-        return { ok: false, terminal: true, status: 400, message: errorMessage };
-      }
-
-      const code = callbackUrl.searchParams.get("code");
+      // Any page can hit the local listener: only a redirect carrying this sign-in's
+      // state may end it, error redirects included (RFC 6749 §4.1.2.1 echoes the state).
       const state = callbackUrl.searchParams.get("state");
-      if (!code || !state) {
+      if (!state) {
         return {
           ok: false,
           terminal: false,
           status: 400,
-          message: "Missing authorization code or state.",
+          message: "Missing OAuth state.",
         };
       }
 
@@ -127,6 +119,24 @@ export function createOAuthAuthorizeMethod(options: OAuthAuthorizeMethodOptions)
           terminal: false,
           status: 400,
           message: "Invalid OAuth state parameter. Return to the sign-in flow and try again.",
+        };
+      }
+
+      const callbackError = callbackUrl.searchParams.get("error");
+      if (callbackError) {
+        const errorMessage = callbackUrl.searchParams.get("error_description") || callbackError;
+        settled = true;
+        finalResult = { type: "failed", error: errorMessage };
+        return { ok: false, terminal: true, status: 400, message: errorMessage };
+      }
+
+      const code = callbackUrl.searchParams.get("code");
+      if (!code) {
+        return {
+          ok: false,
+          terminal: false,
+          status: 400,
+          message: "Missing authorization code.",
         };
       }
 

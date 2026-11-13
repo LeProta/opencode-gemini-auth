@@ -150,6 +150,14 @@ describe("oauth-authorize and localhost callback server", () => {
     const incompleteResp = await harness.dispatchRequest("/oauth2callback?code=only-code");
     expect(incompleteResp.statusCode).toBe(400);
 
+    // An error redirect without this sign-in's state must not end the sign-in.
+    for (const forged of [
+      "/oauth2callback?error=access_denied",
+      "/oauth2callback?error=access_denied&state=wrong-state",
+    ]) {
+      expect((await harness.dispatchRequest(forged)).statusCode).toBe(400);
+    }
+
     const mismatchResp = await harness.dispatchRequest(
       "/oauth2callback?code=any-code&state=wrong-state",
     );
@@ -177,6 +185,27 @@ describe("oauth-authorize and localhost callback server", () => {
     });
     expect(exchangeCalls).toEqual(["bad-code", "good-code"]);
     expect(harness.isClosed()).toBe(true);
+  });
+
+  it("ends the sign-in on an error redirect only when it carries this sign-in's state", async () => {
+    const harness = createInProcessListenerHarness();
+    const authorize = createOAuthAuthorizeMethod({
+      isHeadless: () => false,
+      openBrowser: () => {},
+      authorizeFn: async () => sampleAuth,
+      exchangeFn: async () => ({ type: "failed", error: "unused" }),
+      startListenerFn: harness.startListenerFn,
+    });
+    const method = await authorize();
+    if (method.method !== "auto") throw new Error("Expected auto OAuth method");
+    const resultPromise = method.callback();
+
+    expect((await harness.dispatchRequest("/oauth2callback?error=access_denied&state=wrong-state")).statusCode).toBe(400);
+    const denied = await harness.dispatchRequest(
+      "/oauth2callback?error=access_denied&error_description=User+cancelled&state=expected-state",
+    );
+    expect(denied.statusCode).toBe(400);
+    expect(await resultPromise).toEqual({ type: "failed", error: "User cancelled" });
   });
 
   it("responds with HTTP 502 error page and fails when token exchange fails", async () => {

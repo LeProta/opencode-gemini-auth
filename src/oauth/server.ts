@@ -156,7 +156,13 @@ export function createOAuthCallbackRequestHandler(
       return;
     }
 
-    const url = new URL(request.url, deps.getOrigin());
+    let url: URL;
+    try {
+      url = new URL(request.url, deps.getOrigin());
+    } catch {
+      finishResponse(400, { "Content-Type": "text/plain; charset=utf-8" }, "Invalid request");
+      return;
+    }
     if (url.pathname !== deps.callbackPath) {
       finishResponse(404, { "Content-Type": "text/plain; charset=utf-8" }, "Not found");
       return;
@@ -165,7 +171,7 @@ export function createOAuthCallbackRequestHandler(
     const hasCode = !!url.searchParams.get("code");
     const hasState = !!url.searchParams.get("state");
     const hasError = !!url.searchParams.get("error");
-    if (!hasError && (!hasCode || !hasState)) {
+    if (!hasState || (!hasError && !hasCode)) {
       finishResponse(
         400,
         { "Content-Type": "text/plain; charset=utf-8" },
