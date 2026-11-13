@@ -237,7 +237,7 @@ export function createOAuthAuthorizeMethod(options: OAuthAuthorizeMethodOptions)
     return {
       url: authorization.url,
       instructions:
-        `Complete OAuth in your browser, then paste the full redirected URL (e.g., ${options.redirectUri ?? "http://localhost:<port>/callback"}?code=...&state=...) or just the authorization code.`,
+        `Complete OAuth in your browser, then paste the full redirected URL from the address bar (e.g., ${options.redirectUri ?? "http://localhost:<port>/callback"}?code=...&state=...).`,
       method: "code",
       callback: async (callbackUrl: string): Promise<TokenExchangeResult> => {
         try {
@@ -248,7 +248,11 @@ export function createOAuthAuthorizeMethod(options: OAuthAuthorizeMethodOptions)
           if (!code) {
             return { type: "failed", error: "Missing authorization code in callback input" };
           }
-          if (state && state !== authorization.state) {
+          // A bare code cannot be tied to this sign-in, so the state is required.
+          if (!state) {
+            return { type: "failed", error: "Paste the full redirected URL (it carries the state that ties it to this sign-in)" };
+          }
+          if (state !== authorization.state) {
             return { type: "failed", error: "State mismatch in callback input (possible CSRF attempt)" };
           }
           return await maybeHydrateProjectId(

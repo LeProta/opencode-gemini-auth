@@ -246,6 +246,10 @@ describe("oauth-authorize and localhost callback server", () => {
     );
     expect(badState.type).toBe("failed");
 
+    // A bare code (no state) cannot be tied to this sign-in.
+    const bareCode = await method.callback("c1");
+    expect(bareCode.type).toBe("failed");
+
     const success = await method.callback(
       "http://localhost:8085/oauth2callback?code=c1&state=expected-state",
     );
