@@ -27,7 +27,7 @@ OpenCode v1 (`plugin` key) is not supported.
 ## Install
 
 ```bash
-opencode plugin add github:LeProta/opencode-gemini-auth#v2.1.0
+opencode plugin add github:LeProta/opencode-gemini-auth#v2.1.1
 ```
 
 Pin a tag: `github:LeProta/opencode-gemini-auth` alone follows `main`. To update, change

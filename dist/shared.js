@@ -17,15 +17,20 @@ function contentLength(headers) {
   const value = Number(raw);
   return Number.isSafeInteger(value) ? value : void 0;
 }
-async function readBoundedText(body, limit, label) {
+async function readBoundedText(body, limit, label, signal) {
   if (!body) return "";
+  signal?.throwIfAborted();
   const reader = body.getReader();
+  const onAbort = () => void reader.cancel(signal?.reason).catch(() => {
+  });
+  signal?.addEventListener("abort", onAbort, { once: true });
   const decoder = new TextDecoder();
   const parts = [];
   let total = 0;
   try {
     while (true) {
       const { done, value } = await reader.read();
+      signal?.throwIfAborted();
       if (done) break;
       total += value.byteLength;
       if (total > limit) {
@@ -38,6 +43,7 @@ async function readBoundedText(body, limit, label) {
     parts.push(decoder.decode());
     return parts.join("");
   } finally {
+    signal?.removeEventListener("abort", onAbort);
     reader.releaseLock();
   }
 }
@@ -65,14 +71,14 @@ async function readPrefix(body, maxBytes) {
   }
   return new TextDecoder().decode(bytes.subarray(0, maxBytes));
 }
-async function readResponseText(response, limit, label) {
+async function readResponseText(response, limit, label, signal) {
   const declared = contentLength(response.headers);
   if (declared !== void 0 && declared > limit) {
     await response.body?.cancel().catch(() => {
     });
     throw new BodyLimitError(label, limit);
   }
-  return readBoundedText(response.body, limit, label);
+  return readBoundedText(response.body, limit, label, signal);
 }
 
 // src/cache.ts
@@ -448,7 +454,7 @@ async function loadVersion() {
       headers: { "User-Agent": "electron-builder", "Cache-Control": "no-cache" },
       signal: AbortSignal.timeout(1e4)
     });
-    const version = res.status === 200 ? parseVersionManifest(await res.text()) : null;
+    const version = res.status === 200 ? parseVersionManifest(await readResponseText(res, 64 * 1024, "Antigravity version manifest")) : null;
     if (version) {
       await writeCache({ version, versionFetchedAt: now });
       return version;
@@ -628,6 +634,10 @@ var requestCounter = 0;
 function isGeminiDebugEnabled() {
   return (env.OPENCODE_GEMINI_DEBUG ?? "").trim() === "1";
 }
+function isGeminiDebugContentEnabled() {
+  return isGeminiDebugEnabled() && (env.OPENCODE_GEMINI_DEBUG_CONTENT ?? "").trim() === "1";
+}
+var CONTENT_OMITTED = "omitted (set OPENCODE_GEMINI_DEBUG_CONTENT=1 to log it)";
 function logGeminiDebugMessage(message) {
   if (!isGeminiDebugEnabled()) {
     return;
@@ -653,7 +663,7 @@ function startGeminiDebugRequest(meta) {
   logDebug(`[Gemini Debug ${id}] Headers: ${JSON.stringify(maskHeaders(meta.headers))}`);
   const bodyPreview = formatBodyPreview(meta.body);
   if (bodyPreview) {
-    logDebug(`[Gemini Debug ${id}] Body Preview: ${bodyPreview}`);
+    logDebug(`[Gemini Debug ${id}] Body Preview: ${isGeminiDebugContentEnabled() ? bodyPreview : CONTENT_OMITTED}`);
   }
   return { id, streaming: meta.streaming, startedAt: Date.now() };
 }
@@ -682,7 +692,7 @@ function logGeminiDebugResponse(context, response, meta = {}) {
   }
   if (meta.body) {
     logDebug(
-      `[Gemini Debug ${context.id}] Response Body Preview: ${truncateForLog(meta.body)}`
+      `[Gemini Debug ${context.id}] Response Body Preview: ${isGeminiDebugContentEnabled() ? truncateForLog(meta.body) : CONTENT_OMITTED}`
     );
   }
 }
@@ -848,7 +858,13 @@ function createOAuthCallbackRequestHandler(deps) {
       finishResponse(400, { "Content-Type": "text/plain; charset=utf-8" }, "Invalid request");
       return;
     }
-    const url = new URL(request.url, deps.getOrigin());
+    let url;
+    try {
+      url = new URL(request.url, deps.getOrigin());
+    } catch {
+      finishResponse(400, { "Content-Type": "text/plain; charset=utf-8" }, "Invalid request");
+      return;
+    }
     if (url.pathname !== deps.callbackPath) {
       finishResponse(404, { "Content-Type": "text/plain; charset=utf-8" }, "Not found");
       return;
@@ -856,7 +872,7 @@ function createOAuthCallbackRequestHandler(deps) {
     const hasCode = !!url.searchParams.get("code");
     const hasState = !!url.searchParams.get("state");
     const hasError = !!url.searchParams.get("error");
-    if (!hasError && (!hasCode || !hasState)) {
+    if (!hasState || !hasError && !hasCode) {
       finishResponse(
         400,
         { "Content-Type": "text/plain; charset=utf-8" },
@@ -1157,22 +1173,13 @@ function createOAuthAuthorizeMethod(options) {
           message: finalResult?.type === "failed" ? finalResult.error : "OAuth sign-in has already completed."
         };
       }
-      const callbackError = callbackUrl2.searchParams.get("error");
-      const callbackErrorDescription = callbackUrl2.searchParams.get("error_description");
-      if (callbackError) {
-        const errorMessage = callbackErrorDescription || callbackError;
-        settled = true;
-        finalResult = { type: "failed", error: errorMessage };
-        return { ok: false, terminal: true, status: 400, message: errorMessage };
-      }
-      const code = callbackUrl2.searchParams.get("code");
       const state = callbackUrl2.searchParams.get("state");
-      if (!code || !state) {
+      if (!state) {
         return {
           ok: false,
           terminal: false,
           status: 400,
-          message: "Missing authorization code or state."
+          message: "Missing OAuth state."
         };
       }
       if (state !== authorization.state) {
@@ -1184,6 +1191,22 @@ function createOAuthAuthorizeMethod(options) {
           terminal: false,
           status: 400,
           message: "Invalid OAuth state parameter. Return to the sign-in flow and try again."
+        };
+      }
+      const callbackError = callbackUrl2.searchParams.get("error");
+      if (callbackError) {
+        const errorMessage = callbackUrl2.searchParams.get("error_description") || callbackError;
+        settled = true;
+        finalResult = { type: "failed", error: errorMessage };
+        return { ok: false, terminal: true, status: 400, message: errorMessage };
+      }
+      const code = callbackUrl2.searchParams.get("code");
+      if (!code) {
+        return {
+          ok: false,
+          terminal: false,
+          status: 400,
+          message: "Missing authorization code."
         };
       }
       if (exchangeInFlight) {
@@ -1365,6 +1388,14 @@ function shouldIgnoreMalformedAuthCode(result) {
 }
 
 // src/project.ts
+function errorStatus(text) {
+  try {
+    const status = JSON.parse(text)?.error?.status;
+    if (typeof status === "string" && /^[A-Z_]{1,64}$/.test(status)) return status;
+  } catch {
+  }
+  return "no error status";
+}
 function extractProject(data) {
   if (!data || typeof data !== "object") return "";
   for (const key of ["cloudaicompanionProject", "projectId", "project"]) {
@@ -1383,7 +1414,7 @@ async function resolveProject(accessToken) {
     body: { metadata: { ideType: "ANTIGRAVITY" } }
   });
   if (load.status !== 200) {
-    throw new Error(`Antigravity loadCodeAssist failed (${load.status}): ${load.text.slice(0, 200)}`);
+    throw new Error(`Antigravity loadCodeAssist failed (${load.status}): ${errorStatus(load.text)}`);
   }
   const existing = extractProject(load.json);
   if (existing) return existing;
@@ -1397,7 +1428,7 @@ async function resolveProject(accessToken) {
       timeoutMs: 3e4
     });
     if (res.status !== 200) {
-      throw new Error(`Antigravity onboardUser failed (${res.status}): ${res.text.slice(0, 200)}`);
+      throw new Error(`Antigravity onboardUser failed (${res.status}): ${errorStatus(res.text)}`);
     }
     const project = extractProject(res.json?.response) || extractProject(res.json);
     if (project) return project;
@@ -1507,38 +1538,41 @@ async function exchangeCode(code) {
   }
 }
 var refreshInFlight = /* @__PURE__ */ new Map();
-function refreshAuth(auth, persist) {
+async function refreshAuth(auth, persist) {
   const parts = parseRefreshParts(auth.refresh);
-  const pending = refreshInFlight.get(parts.refreshToken);
-  if (pending) return pending;
-  const run = (async () => {
-    let res;
-    try {
-      res = await postTokenForm(tokenRefreshForm(parts.refreshToken));
-    } catch (error) {
-      throw new Error(`Google token refresh failed: ${error instanceof Error ? error.message : String(error)}`);
-    }
-    if (res.status === 400 || res.status === 401) {
-      throw new Error(
-        `Google refresh token rejected (${oauthErrorCode(res.text)}). Sign in again with \`opencode auth login google --method antigravity\`.`
-      );
-    }
-    if (res.status < 200 || res.status >= 300) {
-      throw new Error(`Google token refresh failed (${res.status} ${oauthErrorCode(res.text)})`);
-    }
-    const tokens = parseTokenResponse(res.text);
-    if (!tokens) throw new Error("Google token refresh returned an invalid token response");
-    const next = {
-      ...auth,
-      access: tokens.access,
-      expires: tokens.expires,
-      refresh: formatRefreshParts({ ...parts, refreshToken: tokens.refresh ?? parts.refreshToken })
-    };
-    await persist(next);
-    return next;
-  })().finally(() => refreshInFlight.delete(parts.refreshToken));
-  refreshInFlight.set(parts.refreshToken, run);
-  return run;
+  let run = refreshInFlight.get(parts.refreshToken);
+  if (!run) {
+    run = requestRefresh(parts.refreshToken).finally(() => refreshInFlight.delete(parts.refreshToken));
+    refreshInFlight.set(parts.refreshToken, run);
+  }
+  const tokens = await run;
+  const next = {
+    ...auth,
+    access: tokens.access,
+    expires: tokens.expires,
+    refresh: formatRefreshParts({ ...parts, refreshToken: tokens.refresh ?? parts.refreshToken })
+  };
+  await persist(next);
+  return next;
+}
+async function requestRefresh(refreshToken) {
+  let res;
+  try {
+    res = await postTokenForm(tokenRefreshForm(refreshToken));
+  } catch (error) {
+    throw new Error(`Google token refresh failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (res.status === 400 || res.status === 401) {
+    throw new Error(
+      `Google refresh token rejected (${oauthErrorCode(res.text)}). Sign in again with \`opencode auth login google --method antigravity\`.`
+    );
+  }
+  if (res.status < 200 || res.status >= 300) {
+    throw new Error(`Google token refresh failed (${res.status} ${oauthErrorCode(res.text)})`);
+  }
+  const tokens = parseTokenResponse(res.text);
+  if (!tokens) throw new Error("Google token refresh returned an invalid token response");
+  return tokens;
 }
 
 // src/quota.ts
@@ -1651,7 +1685,7 @@ async function checkUpstreamUpdate(notify) {
             signal: AbortSignal.timeout(5e3)
           });
           if (!res.ok) throw new Error(`GitHub ${res.status}`);
-          const [commit] = await res.json();
+          const [commit] = JSON.parse(await readResponseText(res, 256 * 1024, "GitHub commit list"));
           return [path, commit?.sha ?? ""];
         })
       );
@@ -2321,13 +2355,14 @@ function makePlaceholderFunctionResponse(call, usesIds) {
 }
 function takeMatchingPendingCallIndex(pendingCalls, functionResponse) {
   const responseId = readString(functionResponse.id);
+  const responseName = readString(functionResponse.name) ?? "";
   if (responseId) {
     const byId = pendingCalls.findIndex((call) => call.id === responseId);
     if (byId !== -1) {
       return byId;
     }
+    return pendingCalls.findIndex((call) => !call.id && call.name === responseName);
   }
-  const responseName = readString(functionResponse.name) ?? "";
   return pendingCalls.findIndex((call) => call.name === responseName);
 }
 function repairGeminiToolPairs(contents, modelId) {
@@ -2685,6 +2720,8 @@ function parseGeminiSseBody(rawText) {
   flush();
   return lastParsed;
 }
+var MAX_GEMINI_RESPONSE_BYTES = 64 * 1024 * 1024;
+var MAX_GEMINI_ERROR_BYTES = 1024 * 1024;
 async function transformGeminiResponse(response, streaming, debugContext, requestedModel) {
   const contentType = response.headers.get("content-type") ?? "";
   const isJsonResponse = contentType.includes("application/json");
@@ -2711,7 +2748,7 @@ async function transformGeminiResponse(response, streaming, debugContext, reques
         headers
       });
     }
-    const text = await response.text();
+    const text = response.ok ? await readResponseText(response, MAX_GEMINI_RESPONSE_BYTES, "Gemini response") : await readResponseText(response, MAX_GEMINI_ERROR_BYTES, "Gemini error response");
     bufferedText = text;
     const init = {
       status: response.status,
@@ -2754,6 +2791,7 @@ async function transformGeminiResponse(response, streaming, debugContext, reques
     }
     return new Response(text, init);
   } catch (error) {
+    if (error instanceof BodyLimitError) throw error;
     logGeminiDebugResponse(debugContext, response, {
       error,
       note: "Failed to transform Gemini response"
@@ -3011,10 +3049,17 @@ function extractSseErrorPayloads(rawText) {
   flush();
   return parsedItems;
 }
+var ERROR_BODY_LIMIT_BYTES = 1024 * 1024;
+var ERROR_BODY_TIMEOUT_MS = 5e3;
 async function parseErrorBody(response) {
   let text = "";
   try {
-    text = await response.clone().text();
+    text = await readResponseText(
+      response.clone(),
+      ERROR_BODY_LIMIT_BYTES,
+      "Gemini error body",
+      AbortSignal.timeout(ERROR_BODY_TIMEOUT_MS)
+    );
   } catch {
     return null;
   }
@@ -3579,7 +3624,7 @@ async function setup(ctx) {
         }
         recentFailures.set(failureKey(event), { status: event.response.status, quotaContext, decision, recordedAt: now });
       }
-      if (snapshot.debugContext) {
+      if (snapshot.debugContext && isGeminiDebugContentEnabled()) {
         void readPrefix(event.response.clone().body, DEBUG_EXCERPT_BYTES).then((raw) => logGeminiDebugMessage(`Google raw response: ${raw}`)).catch(() => {
         });
       }
