@@ -1,3 +1,4 @@
+import { readResponseText } from "../bounded";
 import {
   CLOUDCODE_DOMAINS as CLOUDCODE_DOMAIN_LIST,
   parseRetryDelayFromMessage as parseSharedRetryDelayFromMessage,
@@ -207,12 +208,21 @@ function extractSseErrorPayloads(rawText: string): unknown[] {
   return parsedItems;
 }
 
+const ERROR_BODY_LIMIT_BYTES = 1024 * 1024;
+const ERROR_BODY_TIMEOUT_MS = 5_000;
+
 async function parseErrorBody(
   response: Response,
 ): Promise<{ message?: string; details?: unknown[] } | null> {
   let text = "";
   try {
-    text = await response.clone().text();
+    // Best-effort diagnosis: an oversized or stalled error body is just "unknown".
+    text = await readResponseText(
+      response.clone(),
+      ERROR_BODY_LIMIT_BYTES,
+      "Gemini error body",
+      AbortSignal.timeout(ERROR_BODY_TIMEOUT_MS),
+    );
   } catch {
     return null;
   }

@@ -1,5 +1,6 @@
 /** Antigravity client version reported upstream: override, live manifest, cache, then fallback. */
 import { readCache, writeCache } from "./cache";
+import { readResponseText } from "./bounded";
 import { geminiFetch } from "./fetch";
 import { VERSION, parseVersionManifest } from "./vendor/protocol.js";
 import { FALLBACK_VERSION } from "./wire";
@@ -44,7 +45,7 @@ async function loadVersion(): Promise<string> {
       headers: { "User-Agent": "electron-builder", "Cache-Control": "no-cache" },
       signal: AbortSignal.timeout(10_000),
     });
-    const version = res.status === 200 ? parseVersionManifest(await res.text()) : null;
+    const version = res.status === 200 ? parseVersionManifest(await readResponseText(res, 64 * 1024, "Antigravity version manifest")) : null;
     if (version) {
       await writeCache({ version, versionFetchedAt: now });
       return version;

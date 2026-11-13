@@ -1,4 +1,5 @@
 import { readCache, writeCache } from "./cache";
+import { readResponseText } from "./bounded";
 import { geminiFetch } from "./fetch";
 
 // Updated by `npm run check:cliproxy -- --accept` — do not edit by hand.
@@ -35,7 +36,7 @@ export async function checkUpstreamUpdate(notify: (message: string) => void): Pr
             signal: AbortSignal.timeout(5_000),
           });
           if (!res.ok) throw new Error(`GitHub ${res.status}`);
-          const [commit] = (await res.json()) as Array<{ sha?: string }>;
+          const [commit] = JSON.parse(await readResponseText(res, 256 * 1024, "GitHub commit list")) as Array<{ sha?: string }>;
           return [path, commit?.sha ?? ""] as const;
         }),
       );

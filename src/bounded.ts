@@ -13,20 +13,25 @@ export function contentLength(headers: Headers): number | undefined {
   return Number.isSafeInteger(value) ? value : undefined;
 }
 
-/** Reads a body as UTF-8 text, cancelling it as soon as it grows past `limit` bytes. */
+/** Reads a body as UTF-8 text, cancelling it as soon as it grows past `limit` bytes or `signal` aborts. */
 export async function readBoundedText(
   body: ReadableStream<Uint8Array> | null,
   limit: number,
   label: string,
+  signal?: AbortSignal,
 ): Promise<string> {
   if (!body) return "";
+  signal?.throwIfAborted();
   const reader = body.getReader();
+  const onAbort = () => void reader.cancel(signal?.reason).catch(() => {});
+  signal?.addEventListener("abort", onAbort, { once: true });
   const decoder = new TextDecoder();
   const parts: string[] = [];
   let total = 0;
   try {
     while (true) {
       const { done, value } = await reader.read();
+      signal?.throwIfAborted();
       if (done) break;
       total += value.byteLength;
       if (total > limit) {
@@ -38,6 +43,7 @@ export async function readBoundedText(
     parts.push(decoder.decode());
     return parts.join("");
   } finally {
+    signal?.removeEventListener("abort", onAbort);
     reader.releaseLock();
   }
 }
@@ -68,11 +74,16 @@ export async function readPrefix(body: ReadableStream<Uint8Array> | null, maxByt
 }
 
 /** Reads a Response body with both the declared and the actual size checked. */
-export async function readResponseText(response: Response, limit: number, label: string): Promise<string> {
+export async function readResponseText(
+  response: Response,
+  limit: number,
+  label: string,
+  signal?: AbortSignal,
+): Promise<string> {
   const declared = contentLength(response.headers);
   if (declared !== undefined && declared > limit) {
     await response.body?.cancel().catch(() => {});
     throw new BodyLimitError(label, limit);
   }
-  return readBoundedText(response.body, limit, label);
+  return readBoundedText(response.body, limit, label, signal);
 }

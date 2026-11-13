@@ -28,6 +28,19 @@ describe("bounded reads", () => {
     await expect(readBoundedText(stream("12345", "67890", "x"), 8, "body")).rejects.toBeInstanceOf(BodyLimitError);
   });
 
+  it("cancels a stalled body when the signal aborts", async () => {
+    let cancelled = false;
+    const stalled = new ReadableStream<Uint8Array>({
+      pull: () => new Promise(() => {}),
+      cancel: () => {
+        cancelled = true;
+      },
+    });
+    const read = readBoundedText(stalled, 100, "body", AbortSignal.timeout(20));
+    await expect(read).rejects.toThrow();
+    expect(cancelled).toBe(true);
+  });
+
   it("refuses a declared length above the limit without reading", async () => {
     const response = new Response("tiny", { headers: { "content-length": "999999" } });
     await expect(readResponseText(response, 100, "body")).rejects.toBeInstanceOf(BodyLimitError);

@@ -512,3 +512,13 @@ describe("retry extensions", () => {
     expect(scheduledDelays[1]).toBeGreaterThan(2000);
   });
 });
+
+describe("quota diagnosis body limit", () => {
+  it("treats an oversized error body as unknown without buffering it", async () => {
+    const huge = new Response(`{"error":{"message":"${"x".repeat(2 * 1024 * 1024)}"}}`, {
+      status: 429,
+      headers: { "content-type": "application/json" },
+    });
+    expect(await classifyQuotaResponse(huge)).toBeNull();
+  });
+});

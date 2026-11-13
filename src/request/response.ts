@@ -1,3 +1,4 @@
+import { BodyLimitError, readResponseText } from "../bounded";
 import { logGeminiDebugResponse, type GeminiDebugContext } from "../debug";
 import {
   enhanceGeminiErrorResponse,
@@ -41,6 +42,10 @@ function parseGeminiSseBody(rawText: string): GeminiApiBody | null {
   return lastParsed;
 }
 
+// Successful answers may carry inline images; errors are small JSON envelopes.
+export const MAX_GEMINI_RESPONSE_BYTES = 64 * 1024 * 1024;
+export const MAX_GEMINI_ERROR_BYTES = 1024 * 1024;
+
 /**
  * Normalizes Gemini responses, preserving request metadata and usage counters.
  */
@@ -80,7 +85,9 @@ export async function transformGeminiResponse(
       });
     }
 
-    const text = await response.text();
+    const text = response.ok
+      ? await readResponseText(response, MAX_GEMINI_RESPONSE_BYTES, "Gemini response")
+      : await readResponseText(response, MAX_GEMINI_ERROR_BYTES, "Gemini error response");
     bufferedText = text;
     const init = {
       status: response.status,
@@ -145,6 +152,8 @@ export async function transformGeminiResponse(
 
     return new Response(text, init);
   } catch (error) {
+    // The body is partly consumed: fail visibly instead of returning a broken response.
+    if (error instanceof BodyLimitError) throw error;
     logGeminiDebugResponse(debugContext, response, {
       error,
       note: "Failed to transform Gemini response",

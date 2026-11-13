@@ -58,3 +58,26 @@ describe("streaming SSE transform", () => {
     await expect(new Response(transformStreamingPayloadStream(stream)).text()).rejects.toThrow("SSE line exceeds");
   });
 });
+
+describe("transformGeminiResponse size limits", () => {
+  it("fails visibly on an error body above the error limit instead of buffering it", async () => {
+    const { MAX_GEMINI_ERROR_BYTES, transformGeminiResponse } = await import("./response");
+    const { BodyLimitError } = await import("../bounded");
+    const big = new Response(`{"error":{"message":"${"x".repeat(MAX_GEMINI_ERROR_BYTES)}"}}`, {
+      status: 500,
+      headers: { "content-type": "application/json" },
+    });
+    await expect(transformGeminiResponse(big, false)).rejects.toBeInstanceOf(BodyLimitError);
+  });
+
+  it("still reads a normal error body", async () => {
+    const { transformGeminiResponse } = await import("./response");
+    const small = new Response(`{"error":{"code":500,"message":"boom"}}`, {
+      status: 500,
+      headers: { "content-type": "application/json" },
+    });
+    const out = await transformGeminiResponse(small, false);
+    expect(out.status).toBe(500);
+    expect(await out.text()).toContain("boom");
+  });
+});
