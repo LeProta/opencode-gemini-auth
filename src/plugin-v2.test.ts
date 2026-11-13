@@ -162,6 +162,40 @@ describe("Google OAuth on the built-in provider", () => {
     }
   });
 
+  it("keeps each session's retry decision to itself", async () => {
+    const { ctx, hooks } = fakeContext(subscription);
+    await setup(ctx);
+    const exhausted = () =>
+      new Response(
+        JSON.stringify({
+          error: {
+            message: "quota",
+            details: [{ "@type": "type.googleapis.com/google.rpc.ErrorInfo", reason: "QUOTA_EXHAUSTED", domain: "cloudcode-pa.googleapis.com" }],
+          },
+        }),
+        { status: 429, headers: { "content-type": "application/json" } },
+      );
+    const turn = async (sessionID: string, response: Response) => {
+      const event = {
+        sessionID,
+        agent: "build",
+        model: { id: "gemini-3-flash" },
+        request: new Request("https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash:generateContent", {
+          method: "POST",
+          body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "hi" }] }] }),
+        }),
+      };
+      await hooks.get("http.request")!(event);
+      await hooks.get("http.response")!({ ...event, request: event.request, response });
+    };
+    await turn("session-a", exhausted());
+    await turn("session-b", new Response("busy", { status: 503 }));
+
+    const retryA = { sessionID: "session-a", agent: "build", model: { id: "gemini-3-flash" }, attempt: 1, error: { status: 429, message: "quota" } } as any;
+    await hooks.get("retry")!(retryA);
+    expect(retryA.decision).toEqual({ retry: false });
+  });
+
   it("explains instead of sending a model the subscription lacks", async () => {
     const { ctx, hooks } = fakeContext(subscription);
     await setup(ctx);

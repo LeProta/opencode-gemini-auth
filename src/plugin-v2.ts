@@ -50,6 +50,9 @@ const METHOD_ID = Integration.MethodID.make("antigravity");
 const MARKER = "opencode.provider.google-oauth";
 const QUOTA_TOOL_NAME = "google_quota";
 const RECENT_FAILURE_TTL_MS = 30_000;
+/** Retry state belongs to one conversation turn: session + agent + model. */
+const failureKey = (event: { sessionID?: string; agent?: string; model: { id: string } }) =>
+  `${event.sessionID ?? ""}\u0000${event.agent ?? ""}\u0000${event.model.id}`;
 const MAX_REQUEST_BODY_BYTES = 128 * 1024 * 1024; // inline images included; Anthropic plugin's limit
 const DEBUG_EXCERPT_BYTES = 4000;
 
@@ -367,12 +370,11 @@ export async function setup(ctx: V2Context): Promise<Plugin.Cleanup> {
             Math.min(decision.cooldownMs, Math.max(getMaxRetryDelayMs(), MODEL_CAPACITY_COOLDOWN_MS)),
           );
         }
-        recentFailures.set(snapshot.modelID, {
-          status: event.response.status,
-          quotaContext,
-          decision,
-          recordedAt: Date.now(),
-        });
+        const now = Date.now();
+        for (const [key, stale] of recentFailures) {
+          if (now - stale.recordedAt > RECENT_FAILURE_TTL_MS) recentFailures.delete(key);
+        }
+        recentFailures.set(failureKey(event), { status: event.response.status, quotaContext, decision, recordedAt: now });
       }
 
       if (snapshot.debugContext) {
@@ -400,8 +402,8 @@ export async function setup(ctx: V2Context): Promise<Plugin.Cleanup> {
         event.decision = { retry: false };
         return;
       }
-      const failure = recentFailures.get(event.model.id);
-      recentFailures.delete(event.model.id);
+      const failure = recentFailures.get(failureKey(event));
+      recentFailures.delete(failureKey(event));
       const recent = failure && Date.now() - failure.recordedAt <= RECENT_FAILURE_TTL_MS ? failure : undefined;
       if (recent?.quotaContext?.terminal) {
         event.decision = { retry: false };
