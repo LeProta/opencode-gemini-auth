@@ -9,6 +9,7 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
+import { readResponseText } from "../bounded";
 import { GEMINI_CODE_ASSIST_ENDPOINT } from "../constants";
 import { geminiFetch } from "../fetch";
 import { formatRefreshParts, parseRefreshParts } from "../plugin/auth";
@@ -31,6 +32,7 @@ import { FALLBACK_VERSION, GOOG_API_CLIENT, antigravityEnvelope, defaultTierId, 
 const VERSION_TTL_MS = 6 * 60 * 60 * 1000;
 const VERSION_MEMO_MS = 10 * 60 * 1000;
 const UPDATE_CHECK_TTL_MS = 24 * 60 * 60 * 1000;
+const MAX_UPSTREAM_JSON_BYTES = 4 * 1024 * 1024;
 
 export interface ModelCaps {
   contextLength?: number;
@@ -157,9 +159,10 @@ async function upstreamJson(
     method,
     headers,
     body: body === undefined ? undefined : JSON.stringify(body),
+    redirect: "error",
     signal: AbortSignal.timeout(timeoutMs),
   });
-  const text = await res.text();
+  const text = await readResponseText(res, MAX_UPSTREAM_JSON_BYTES, "Google API response");
   let json: any = null;
   try {
     json = JSON.parse(text);
@@ -181,32 +184,73 @@ function extractProject(data: unknown): string {
 // OAuth token exchange / refresh
 // ---------------------------------------------------------------------------
 
+const TOKEN_TIMEOUT_MS = 15_000;
+const MAX_TOKEN_RESPONSE_BYTES = 64 * 1024;
+const MAX_TOKEN_LENGTH = 8 * 1024;
+
+export interface TokenResponse {
+  access: string;
+  expires: number;
+  refresh?: string;
+}
+
+const isBoundedToken = (value: unknown): value is string =>
+  typeof value === "string" && value.length > 0 && value.length <= MAX_TOKEN_LENGTH;
+
+/** Validates Google's token JSON at runtime; undefined when anything is missing or malformed. */
+export function parseTokenResponse(text: string, now = Date.now()): TokenResponse | undefined {
+  let value: Record<string, unknown>;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+  if (!value || typeof value !== "object" || !isBoundedToken(value.access_token)) return undefined;
+  const expiresIn = value.expires_in === undefined ? 3600 : value.expires_in;
+  if (typeof expiresIn !== "number" || !Number.isSafeInteger(expiresIn) || expiresIn <= 0) return undefined;
+  if (value.refresh_token !== undefined && !isBoundedToken(value.refresh_token)) return undefined;
+  return { access: value.access_token, expires: now + expiresIn * 1000, refresh: value.refresh_token as string | undefined };
+}
+
+/** Only Google's error code (e.g. invalid_grant), never the raw body. */
+function oauthErrorCode(text: string): string {
+  try {
+    const code = JSON.parse(text)?.error;
+    if (typeof code === "string" && /^[a-z_]{1,64}$/.test(code)) return code;
+  } catch {}
+  return "unknown_error";
+}
+
+/** One POST to Google's token endpoint: bounded, no redirects, validated JSON. */
+async function postTokenForm(form: URLSearchParams): Promise<{ status: number; text: string }> {
+  const ua = userAgents(await currentVersion());
+  const res = await geminiFetch(OAUTH.tokenEndpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": ua.refresh },
+    body: form.toString(),
+    redirect: "error",
+    signal: AbortSignal.timeout(TOKEN_TIMEOUT_MS),
+  });
+  return { status: res.status, text: await readResponseText(res, MAX_TOKEN_RESPONSE_BYTES, "Google token response") };
+}
+
 /** Matches `exchangeGeminiWithVerifier`'s shape; Antigravity's client uses no PKCE. */
 export async function exchangeCode(code: string): Promise<TokenExchangeResult> {
   try {
     const ua = userAgents(await currentVersion());
-    const res = await geminiFetch(OAUTH.tokenEndpoint, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": ua.refresh },
-      body: tokenExchangeForm(code).toString(),
-      signal: AbortSignal.timeout(15_000),
-    });
-    const text = await res.text();
-    if (!res.ok) return { type: "failed", error: text };
-    const tokens = JSON.parse(text) as { access_token: string; refresh_token?: string; expires_in?: number };
-    if (!tokens.refresh_token) return { type: "failed", error: "Missing refresh token in response" };
+    const res = await postTokenForm(tokenExchangeForm(code));
+    if (res.status < 200 || res.status >= 300) {
+      return { type: "failed", error: `Google rejected the authorization code (${res.status} ${oauthErrorCode(res.text)})` };
+    }
+    const tokens = parseTokenResponse(res.text);
+    if (!tokens) return { type: "failed", error: "Google returned an invalid token response" };
+    if (!tokens.refresh) return { type: "failed", error: "Missing refresh token in response" };
     let email: string | undefined;
     try {
-      const info = await upstreamJson(OAUTH.userinfoEndpoint, { method: "GET", token: tokens.access_token, ua: ua.short });
-      email = info.json?.email;
+      const info = await upstreamJson(OAUTH.userinfoEndpoint, { method: "GET", token: tokens.access, ua: ua.short });
+      if (typeof info.json?.email === "string") email = info.json.email;
     } catch {}
-    return {
-      type: "success",
-      refresh: tokens.refresh_token,
-      access: tokens.access_token,
-      expires: Date.now() + (Number(tokens.expires_in) || 3600) * 1000,
-      email,
-    };
+    return { type: "success", refresh: tokens.refresh, access: tokens.access, expires: tokens.expires, email };
   } catch (error) {
     return { type: "failed", error: error instanceof Error ? error.message : String(error) };
   }
@@ -223,26 +267,27 @@ export function refreshAuth(
   const pending = refreshInFlight.get(parts.refreshToken);
   if (pending) return pending;
   const run = (async () => {
-    const ua = userAgents(await currentVersion());
-    const res = await geminiFetch(OAUTH.tokenEndpoint, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": ua.refresh },
-      body: tokenRefreshForm(parts.refreshToken).toString(),
-      signal: AbortSignal.timeout(15_000),
-    });
-    const text = await res.text();
-    if (res.status === 400) {
+    let res: { status: number; text: string };
+    try {
+      res = await postTokenForm(tokenRefreshForm(parts.refreshToken));
+    } catch (error) {
+      throw new Error(`Google token refresh failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (res.status === 400 || res.status === 401) {
       throw new Error(
-        `Antigravity refresh token rejected (${text.slice(0, 200)}). Run \`opencode auth login\` and pick Google (Antigravity) again.`,
+        `Google refresh token rejected (${oauthErrorCode(res.text)}). Sign in again with \`opencode auth login google --method antigravity\`.`,
       );
     }
-    if (!res.ok) throw new Error(`Antigravity token refresh failed (${res.status}): ${text.slice(0, 200)}`);
-    const json = JSON.parse(text) as { access_token: string; refresh_token?: string; expires_in?: number };
+    if (res.status < 200 || res.status >= 300) {
+      throw new Error(`Google token refresh failed (${res.status} ${oauthErrorCode(res.text)})`);
+    }
+    const tokens = parseTokenResponse(res.text);
+    if (!tokens) throw new Error("Google token refresh returned an invalid token response");
     const next: OAuthAuthDetails = {
       ...auth,
-      access: json.access_token,
-      expires: Date.now() + (Number(json.expires_in) || 3600) * 1000,
-      refresh: formatRefreshParts({ ...parts, refreshToken: json.refresh_token || parts.refreshToken }),
+      access: tokens.access,
+      expires: tokens.expires,
+      refresh: formatRefreshParts({ ...parts, refreshToken: tokens.refresh ?? parts.refreshToken }),
     };
     await persist(next);
     return next;
