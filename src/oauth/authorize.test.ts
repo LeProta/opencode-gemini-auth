@@ -289,4 +289,29 @@ describe("oauth-authorize and localhost callback server", () => {
       expires: expect.any(Number),
     });
   });
+
+  it("frees the callback port of an abandoned sign-in when a new one starts", async () => {
+    const authorize = createOAuthAuthorizeMethod({
+      redirectUri: "http://localhost:51197/oauth-callback",
+      isHeadless: () => false,
+      openBrowser: () => {},
+      authorizeFn: async () => sampleAuth,
+      exchangeFn: async () => ({ type: "failed", error: "unused" }),
+    });
+
+    const abandoned = await authorize();
+    if (abandoned.method !== "auto") throw new Error("Expected auto OAuth method");
+    const abandonedResult = abandoned.callback();
+
+    // The user gave up and starts again: the fixed port must be available.
+    const retried = await authorize();
+    expect(retried.method).toBe("auto");
+    expect(await abandonedResult).toEqual({ type: "failed", error: "OAuth listener closed before callback" });
+
+    if (retried.method !== "auto") throw new Error("Expected auto OAuth method");
+    const retriedResult = retried.callback();
+    const page = await fetch("http://127.0.0.1:51197/oauth-callback?error=access_denied&state=expected-state");
+    expect(page.status).toBe(400);
+    expect(await retriedResult).toEqual({ type: "failed", error: "access_denied" });
+  });
 });

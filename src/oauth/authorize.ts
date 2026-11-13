@@ -43,6 +43,9 @@ export function createOAuthAuthorizeMethod(options: OAuthAuthorizeMethodOptions)
   const { authorizeFn, exchangeFn, resolveProjectContextFn } = options;
   const startListenerFn = options.startListenerFn ?? startOAuthListener;
   const openBrowser = options.openBrowser ?? openBrowserUrl;
+  // The redirect port is fixed: a sign-in left unfinished would keep it for the whole
+  // timeout and push the next attempt into the paste-the-URL flow.
+  let activeListener: OAuthListener | null = null;
 
   return async () => {
     const maybeHydrateProjectId = async (result: TokenExchangeResult): Promise<TokenExchangeResult> => {
@@ -194,11 +197,15 @@ export function createOAuthAuthorizeMethod(options: OAuthAuthorizeMethodOptions)
     let listener: OAuthListener | null = null;
     if (!isHeadless) {
       try {
+        const superseded = activeListener;
+        activeListener = null;
+        await superseded?.close().catch(() => {});
         listener = await startListenerFn({
           timeoutMs: options.timeoutMs,
           redirectUri: options.redirectUri,
           onCallback: handleCallbackUrl,
         });
+        activeListener = listener;
       } catch (error) {
         const detail = error instanceof Error ? ` (${error.message})` : "";
         console.log(
@@ -236,6 +243,7 @@ export function createOAuthAuthorizeMethod(options: OAuthAuthorizeMethodOptions)
               error: error instanceof Error ? error.message : "Unknown error",
             };
           } finally {
+            if (activeListener === listener) activeListener = null;
             try {
               await listener?.close();
             } catch {}
