@@ -187,19 +187,22 @@ function attachUsageHeaders(headers: Headers, effectiveBody: unknown): void {
   }
 }
 
-function transformStreamingPayloadStream(stream: ReadableStream<Uint8Array>): ReadableStream<Uint8Array> {
+/** Same bounds as the Anthropic plugin's SSE transform. */
+export const MAX_SSE_LINE_CHARS = 5 * 1024 * 1024;
+export const MAX_SSE_EVENT_CHARS = 8 * 1024 * 1024;
+
+type Sink = { enqueue(chunk: Uint8Array): void };
+
+export function transformStreamingPayloadStream(stream: ReadableStream<Uint8Array>): ReadableStream<Uint8Array> {
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
   let buffer = "";
   let pendingDataLines: string[] = [];
   let pendingOtherLines: string[] = [];
+  let pendingChars = 0;
   let pendingLineEnding = "\n";
-  let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
 
-  const flushEvent = (
-    controller: ReadableStreamDefaultController<Uint8Array>,
-    trailingSeparator: string,
-  ): void => {
+  const flushEvent = (controller: Sink, trailingSeparator: string): void => {
     const hasData = pendingDataLines.length > 0;
     const hasOther = pendingOtherLines.length > 0;
     if (!hasData && !hasOther) {
@@ -217,14 +220,11 @@ function transformStreamingPayloadStream(stream: ReadableStream<Uint8Array>): Re
 
     pendingDataLines = [];
     pendingOtherLines = [];
+    pendingChars = 0;
     controller.enqueue(encoder.encode(`${outputLines.join(pendingLineEnding)}${trailingSeparator}`));
   };
 
-  const processLine = (
-    rawLine: string,
-    lineEnding: string,
-    controller: ReadableStreamDefaultController<Uint8Array>,
-  ): void => {
+  const processLine = (rawLine: string, lineEnding: string, controller: Sink): void => {
     if (rawLine === "") {
       const separator = lineEnding ? `${pendingLineEnding}${lineEnding}` : pendingLineEnding;
       flushEvent(controller, separator);
@@ -236,6 +236,8 @@ function transformStreamingPayloadStream(stream: ReadableStream<Uint8Array>): Re
     } else if (pendingDataLines.length === 0 && pendingOtherLines.length === 0) {
       pendingLineEnding = "";
     }
+    pendingChars += rawLine.length;
+    if (pendingChars > MAX_SSE_EVENT_CHARS) throw new Error(`SSE event exceeds ${MAX_SSE_EVENT_CHARS} characters`);
     if (rawLine.startsWith("data:")) {
       pendingDataLines.push(rawLine.slice(5).trimStart());
       return;
@@ -243,49 +245,33 @@ function transformStreamingPayloadStream(stream: ReadableStream<Uint8Array>): Re
     pendingOtherLines.push(rawLine);
   };
 
-  return new ReadableStream<Uint8Array>({
-    start(controller) {
-      reader = stream.getReader();
-      const pump = (): void => {
-        reader!
-          .read()
-          .then(({ done, value }) => {
-            if (done) {
-              buffer += decoder.decode();
-              if (buffer.length > 0) {
-                const rawLine = buffer.endsWith("\r") ? buffer.slice(0, -1) : buffer;
-                buffer = "";
-                processLine(rawLine, "", controller);
-              }
-              flushEvent(controller, pendingLineEnding);
-              controller.close();
-              return;
-            }
-
-            buffer += decoder.decode(value, { stream: true });
-            let newlineIndex = buffer.indexOf("\n");
-            while (newlineIndex !== -1) {
-              const line = buffer.slice(0, newlineIndex);
-              buffer = buffer.slice(newlineIndex + 1);
-              const hasCr = line.endsWith("\r");
-              const rawLine = hasCr ? line.slice(0, -1) : line;
-              processLine(rawLine, hasCr ? "\r\n" : "\n", controller);
-              newlineIndex = buffer.indexOf("\n");
-            }
-            pump();
-          })
-          .catch((error) => {
-            controller.error(error);
-          });
-      };
-      pump();
-    },
-    cancel(reason) {
-      if (reader) {
-        reader.cancel(reason).catch(() => {});
-      }
-    },
-  });
+  // pipeThrough reads the upstream only as fast as OpenCode consumes, and
+  // forwards cancellation to it.
+  return stream.pipeThrough(
+    new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        buffer += decoder.decode(chunk, { stream: true });
+        let newlineIndex = buffer.indexOf("\n");
+        while (newlineIndex !== -1) {
+          const line = buffer.slice(0, newlineIndex);
+          buffer = buffer.slice(newlineIndex + 1);
+          const hasCr = line.endsWith("\r");
+          processLine(hasCr ? line.slice(0, -1) : line, hasCr ? "\r\n" : "\n", controller);
+          newlineIndex = buffer.indexOf("\n");
+        }
+        if (buffer.length > MAX_SSE_LINE_CHARS) throw new Error(`SSE line exceeds ${MAX_SSE_LINE_CHARS} characters`);
+      },
+      flush(controller) {
+        buffer += decoder.decode();
+        if (buffer.length > 0) {
+          const rawLine = buffer.endsWith("\r") ? buffer.slice(0, -1) : buffer;
+          buffer = "";
+          processLine(rawLine, "", controller);
+        }
+        flushEvent(controller, pendingLineEnding);
+      },
+    }),
+  );
 }
 
 function transformStreamingDataPayload(json: string): string {
