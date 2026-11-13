@@ -4,6 +4,15 @@ import { upstreamJson } from "./fetch";
 import { API } from "./vendor/protocol.js";
 import { GOOG_API_CLIENT, defaultTierId, onboardBody, userAgents } from "./wire";
 
+/** Google's error status (e.g. PERMISSION_DENIED), never the raw body, which can echo request data. */
+function errorStatus(text: string): string {
+  try {
+    const status = JSON.parse(text)?.error?.status;
+    if (typeof status === "string" && /^[A-Z_]{1,64}$/.test(status)) return status;
+  } catch {}
+  return "no error status";
+}
+
 function extractProject(data: unknown): string {
   if (!data || typeof data !== "object") return "";
   for (const key of ["cloudaicompanionProject", "projectId", "project"]) {
@@ -23,7 +32,7 @@ export async function resolveProject(accessToken: string): Promise<string> {
     body: { metadata: { ideType: "ANTIGRAVITY" } },
   });
   if (load.status !== 200) {
-    throw new Error(`Antigravity loadCodeAssist failed (${load.status}): ${load.text.slice(0, 200)}`);
+    throw new Error(`Antigravity loadCodeAssist failed (${load.status}): ${errorStatus(load.text)}`);
   }
   const existing = extractProject(load.json);
   if (existing) return existing;
@@ -38,7 +47,7 @@ export async function resolveProject(accessToken: string): Promise<string> {
       timeoutMs: 30_000,
     });
     if (res.status !== 200) {
-      throw new Error(`Antigravity onboardUser failed (${res.status}): ${res.text.slice(0, 200)}`);
+      throw new Error(`Antigravity onboardUser failed (${res.status}): ${errorStatus(res.text)}`);
     }
     const project = extractProject(res.json?.response) || extractProject(res.json);
     if (project) return project;

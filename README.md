@@ -72,7 +72,8 @@ With an API key connected instead, the plugin leaves the Google provider alone.
 | `OPENCODE_ANTIGRAVITY_UPDATE_CHECK=0` | Turns off the daily CLIProxyAPI change check. |
 | `OPENCODE_GEMINI_MAX_RETRY_MS` | Longest server-requested retry delay to wait for. |
 | `OPENCODE_GEMINI_AUTH_PROXY` | HTTP proxy for the plugin's own requests. |
-| `OPENCODE_GEMINI_DEBUG=1` | Logs each request (tokens redacted), the model mapping, the final `generationConfig` and a 4 KB raw response excerpt to the plugin's log directory. Prompts and answers are **not** redacted: keep it off by default. |
+| `OPENCODE_GEMINI_DEBUG=1` | Logs each request's URL, status, timing, trace id, masked headers, the model mapping and the final `generationConfig` to the plugin's log directory. No prompt, answer or tool result. |
+| `OPENCODE_GEMINI_DEBUG_CONTENT=1` | With `OPENCODE_GEMINI_DEBUG=1`: also logs request and response body previews and a 4 KB raw response excerpt. These contain your prompts and answers (tokens stay redacted): turn it on only to diagnose a problem. |
 
 ## How it works
 

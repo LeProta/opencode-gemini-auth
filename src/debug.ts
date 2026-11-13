@@ -50,6 +50,15 @@ export function isGeminiDebugEnabled(): boolean {
 }
 
 /**
+ * Prompts, answers and tool results are logged only on this second, explicit opt-in.
+ */
+export function isGeminiDebugContentEnabled(): boolean {
+  return isGeminiDebugEnabled() && (env.OPENCODE_GEMINI_DEBUG_CONTENT ?? "").trim() === "1";
+}
+
+const CONTENT_OMITTED = "omitted (set OPENCODE_GEMINI_DEBUG_CONTENT=1 to log it)";
+
+/**
  * Writes an arbitrary debug line when debugging is enabled.
  */
 export function logGeminiDebugMessage(message: string): void {
@@ -92,7 +101,7 @@ export function startGeminiDebugRequest(meta: GeminiDebugRequestMeta): GeminiDeb
   logDebug(`[Gemini Debug ${id}] Headers: ${JSON.stringify(maskHeaders(meta.headers))}`);
   const bodyPreview = formatBodyPreview(meta.body);
   if (bodyPreview) {
-    logDebug(`[Gemini Debug ${id}] Body Preview: ${bodyPreview}`);
+    logDebug(`[Gemini Debug ${id}] Body Preview: ${isGeminiDebugContentEnabled() ? bodyPreview : CONTENT_OMITTED}`);
   }
 
   return { id, streaming: meta.streaming, startedAt: Date.now() };
@@ -135,7 +144,7 @@ export function logGeminiDebugResponse(
 
   if (meta.body) {
     logDebug(
-      `[Gemini Debug ${context.id}] Response Body Preview: ${truncateForLog(meta.body)}`,
+      `[Gemini Debug ${context.id}] Response Body Preview: ${isGeminiDebugContentEnabled() ? truncateForLog(meta.body) : CONTENT_OMITTED}`,
     );
   }
 }

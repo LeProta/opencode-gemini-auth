@@ -21,7 +21,12 @@ import { checkUpstreamUpdate } from "./upstream";
 import { readBoundedText, readPrefix } from "./bounded";
 import { geminiFetch } from "./fetch";
 import { accessTokenExpired, parseRefreshParts } from "./refresh-parts";
-import { logGeminiDebugMessage, startGeminiDebugRequest, type GeminiDebugContext } from "./debug";
+import {
+  isGeminiDebugContentEnabled,
+  logGeminiDebugMessage,
+  startGeminiDebugRequest,
+  type GeminiDebugContext,
+} from "./debug";
 import { isGenerativeLanguageRequest, prepareGeminiRequest, transformGeminiResponse } from "./request";
 import { parseRetryDelayFromMessage } from "./request/helpers";
 import {
@@ -386,8 +391,8 @@ export async function setup(ctx: V2Context): Promise<Plugin.Cleanup> {
         recentFailures.set(failureKey(event), { status: event.response.status, quotaContext, decision, recordedAt: now });
       }
 
-      if (snapshot.debugContext) {
-        // Debug only: tee the raw upstream stream into the log (thought parts included).
+      if (snapshot.debugContext && isGeminiDebugContentEnabled()) {
+        // Content debug only: tee the raw upstream stream into the log (thought parts included).
         void readPrefix(event.response.clone().body, DEBUG_EXCERPT_BYTES)
           .then((raw) => logGeminiDebugMessage(`Google raw response: ${raw}`))
           .catch(() => {});

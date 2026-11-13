@@ -15,6 +15,7 @@ describe("debug", () => {
   const tempDirs: string[] = [];
 
   afterEach(() => {
+    delete process.env.OPENCODE_GEMINI_DEBUG_CONTENT;
     if (originalDebug === undefined) {
       delete process.env.OPENCODE_GEMINI_DEBUG;
     } else {
@@ -49,6 +50,7 @@ describe("debug", () => {
     tempDirs.push(tempDir);
     process.env.OPENCODE_DATA_DIR = tempDir;
     process.env.OPENCODE_GEMINI_DEBUG = "1";
+    process.env.OPENCODE_GEMINI_DEBUG_CONTENT = "1";
 
     const ctx = startGeminiDebugRequest({
       originalUrl: "https://example.test/v1?access_token=ya29.secret_url_tok",
@@ -80,5 +82,28 @@ describe("debug", () => {
     expect(content).not.toContain("secret_body_refresh");
     expect(content).not.toContain("secret_msg_token");
     expect(content).not.toContain("secret_response_token");
+  });
+
+  it("keeps prompts and answers out of the log unless content logging is opted into", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "gemini-debug-test-"));
+    tempDirs.push(tempDir);
+    process.env.OPENCODE_DATA_DIR = tempDir;
+    process.env.OPENCODE_GEMINI_DEBUG = "1";
+
+    const ctx = startGeminiDebugRequest({
+      originalUrl: "https://example.test/v1",
+      resolvedUrl: "https://example.test/v1",
+      method: "POST",
+      body: JSON.stringify({ contents: [{ parts: [{ text: "private prompt words" }] }] }),
+      streaming: false,
+    });
+    logGeminiDebugResponse(ctx, new Response("ok", { status: 200 }), { body: '{"text":"private answer words"}' });
+
+    const logDir = join(tempDir, "gemini-auth", "logs");
+    const content = readFileSync(join(logDir, readdirSync(logDir)[0] as string), "utf8");
+    expect(content).toContain("Response 200");
+    expect(content).toContain("OPENCODE_GEMINI_DEBUG_CONTENT=1");
+    expect(content).not.toContain("private prompt words");
+    expect(content).not.toContain("private answer words");
   });
 });
