@@ -462,6 +462,30 @@ describe("request helpers", () => {
     expect(repaired[3]!.parts).toEqual([{ text: "never mind, continue" }]);
   });
 
+  it("never pairs a tool result with a different call id of the same tool", () => {
+    const repaired = repairGeminiToolPairs(
+      [
+        { role: "model", parts: [{ functionCall: { id: "call-A", name: "read", args: {} } }] },
+        {
+          role: "user",
+          parts: [{ functionResponse: { id: "call-B", name: "read", response: { output: "B" } } }],
+        },
+      ],
+      "gemini-3-flash-preview",
+    ) as Array<{ role: string; parts: Array<{ functionResponse: Record<string, unknown> }> }>;
+
+    expect(repaired.length).toBe(2);
+    expect(repaired[1]!.parts).toEqual([
+      {
+        functionResponse: {
+          id: "call-A",
+          name: "read",
+          response: { error: "Tool call was interrupted before receiving a response." },
+        },
+      },
+    ]);
+  });
+
   it("serializes enhanced 429 JSON and SSE error responses and usage headers without cache", async () => {
     const jsonErr = new Response(
       JSON.stringify({

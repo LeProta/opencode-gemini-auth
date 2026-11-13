@@ -190,13 +190,15 @@ function takeMatchingPendingCallIndex(
   functionResponse: Record<string, unknown>,
 ): number {
   const responseId = readString(functionResponse.id);
+  const responseName = readString(functionResponse.name) ?? "";
   if (responseId) {
     const byId = pendingCalls.findIndex((call) => call.id === responseId);
     if (byId !== -1) {
       return byId;
     }
+    // A result that names an id answers that call only; matching by name is for calls without ids.
+    return pendingCalls.findIndex((call) => !call.id && call.name === responseName);
   }
-  const responseName = readString(functionResponse.name) ?? "";
   return pendingCalls.findIndex((call) => call.name === responseName);
 }
 
