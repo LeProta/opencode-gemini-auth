@@ -35,7 +35,9 @@ export async function readBoundedText(
       if (done) break;
       total += value.byteLength;
       if (total > limit) {
-        await reader.cancel().catch(() => {});
+        // Not awaited (here and below): on a cloned body, one branch of a tee, cancel()
+        // settles only once the other branch is cancelled or the source ends.
+        void reader.cancel().catch(() => {});
         throw new BodyLimitError(label, limit);
       }
       parts.push(decoder.decode(value, { stream: true }));
@@ -62,7 +64,7 @@ export async function readPrefix(body: ReadableStream<Uint8Array> | null, maxByt
       total += value.byteLength;
     }
   } finally {
-    await reader.cancel().catch(() => {});
+    void reader.cancel().catch(() => {});
   }
   const bytes = new Uint8Array(total);
   let offset = 0;
@@ -82,7 +84,7 @@ export async function readResponseText(
 ): Promise<string> {
   const declared = contentLength(response.headers);
   if (declared !== undefined && declared > limit) {
-    await response.body?.cancel().catch(() => {});
+    void response.body?.cancel().catch(() => {});
     throw new BodyLimitError(label, limit);
   }
   return readBoundedText(response.body, limit, label, signal);
