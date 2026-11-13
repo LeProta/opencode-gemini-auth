@@ -43,7 +43,10 @@ export interface ModelCaps {
 export interface AntigravityCache {
   version?: string;
   versionFetchedAt?: number;
+  /** Last catalog fetched (pre-2.1 caches only have this). */
   models?: string[];
+  /** Catalog of each account, by Cloud Code project. */
+  modelsByProject?: Record<string, string[]>;
   modelCaps?: Record<string, ModelCaps>;
   updateCheckedAt?: number;
   upstreamShas?: Record<string, string>;
@@ -353,7 +356,12 @@ export async function refreshModels(accessToken: string, project: string): Promi
       const { ids, caps } = parseAvailableModels(res.json);
       const models = ids.filter(isPublishableModelId);
       if (!models.length) continue;
-      await writeCache({ models, modelCaps: caps as Record<string, ModelCaps> });
+      const { modelsByProject } = await readCache();
+      await writeCache({
+        models,
+        modelsByProject: { ...modelsByProject, [project]: models },
+        modelCaps: caps as Record<string, ModelCaps>,
+      });
       return models;
     } catch {}
   }

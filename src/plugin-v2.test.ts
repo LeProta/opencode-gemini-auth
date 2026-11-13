@@ -31,6 +31,8 @@ function fakeContext(credential: unknown) {
         version: "2.31.2",
         versionFetchedAt: Date.now(),
         models: ["gemini-2.5-pro", "gemini-3-flash", "gemini-3.8-flash-low", "gemini-3.8-flash-high"],
+        // Two accounts on different plans (the cache module keeps the first storage it is given).
+        modelsByProject: { "proj-ultra": ["gemini-2.5-pro", "gemini-3-flash"], "proj-pro": ["gemini-3-flash"] },
       },
     ],
   ]);
@@ -160,6 +162,18 @@ describe("Google OAuth on the built-in provider", () => {
     } finally {
       globalThis.fetch = offline;
     }
+  });
+
+  it("filters models with the catalog of the account in use", async () => {
+    const visible = async (project: string) => {
+      const { ctx, transforms } = fakeContext({ ...subscription, refresh: `rt-${project}|${project}` });
+      await setup(ctx);
+      const { draft, models } = googleDraft(["gemini-2.5-pro", "gemini-3-flash"]);
+      transforms.provider!(draft);
+      return [...models.keys()];
+    };
+    expect(await visible("proj-ultra")).toEqual(["gemini-2.5-pro", "gemini-3-flash"]);
+    expect(await visible("proj-pro")).toEqual(["gemini-3-flash"]);
   });
 
   it("keeps each session's retry decision to itself", async () => {

@@ -81,8 +81,8 @@ interface RecentFailure {
 }
 
 // Shared by every plugin instance in the process (OpenCode sets the plugin up once per directory).
-/** Model ids the account's Antigravity catalog serves; undefined until known. */
-let catalog: string[] | undefined;
+/** Model ids each account's Antigravity catalog serves, by Cloud Code project. */
+const catalogs = new Map<string, string[]>();
 const projectByToken = new Map<string, string>();
 /** Only used when OpenCode hands over an already expired credential. */
 const fallbackAuth = new Map<string, OAuthAuthDetails>();
@@ -149,6 +149,12 @@ async function activeAuth(ctx: V2Context): Promise<OAuthAuthDetails | undefined>
   return (await activeSession(ctx))?.auth;
 }
 
+/** Project of a stored credential, without any network call. */
+function credentialProject(credential: Credential.OAuth): string | undefined {
+  const fromMetadata = credential.metadata?.projectId;
+  return parseRefreshParts(credential.refresh).projectId ?? (typeof fromMetadata === "string" ? fromMetadata : undefined);
+}
+
 async function projectFor(auth: OAuthAuthDetails): Promise<string> {
   const parts = parseRefreshParts(auth.refresh);
   if (parts.projectId) return parts.projectId;
@@ -183,16 +189,22 @@ export async function setup(ctx: V2Context): Promise<Plugin.Cleanup> {
   const recentFailures = new Map<string, RecentFailure>();
   const eventAbort = new AbortController();
   let oauthActive = false;
+  let activeProject: string | undefined;
+  let disposed = false;
 
   const syncActive = async () => {
-    oauthActive = !!(await activeCredential(ctx).catch(() => undefined));
+    const credential = await activeCredential(ctx).catch(() => undefined);
+    oauthActive = !!credential;
+    activeProject = credential ? credentialProject(credential) : undefined;
   };
 
-  if (!catalog) {
-    const cached = (await readCache()).models;
-    if (cached?.length) catalog = cached;
-  }
   await syncActive();
+  const cache = await readCache();
+  for (const [project, ids] of Object.entries(cache.modelsByProject ?? {})) {
+    if (!catalogs.has(project) && ids.length) catalogs.set(project, ids);
+  }
+  // Caches written before 2.1 hold one unkeyed list: it can only be the account in use.
+  if (activeProject && !catalogs.has(activeProject) && cache.models?.length) catalogs.set(activeProject, cache.models);
 
   await ctx.integration.transform((draft) => {
     draft.method.update({
@@ -232,6 +244,7 @@ export async function setup(ctx: V2Context): Promise<Plugin.Cleanup> {
   await ctx.provider.transform((draft) => {
     const record = draft.get(GOOGLE_ID);
     if (!record || !oauthActive) return;
+    const catalog = activeProject ? catalogs.get(activeProject) : undefined;
     for (const modelID of [...record.models.keys()]) {
       if (catalog && !upstreamModelFor(modelID, catalog)) {
         draft.models.remove(GOOGLE_ID, modelID);
@@ -245,13 +258,14 @@ export async function setup(ctx: V2Context): Promise<Plugin.Cleanup> {
 
   /** Refreshes the account catalog and, when it changed, rebuilds the model list. */
   const syncModels = async (auth: OAuthAuthDetails) => {
-    const ids = await refreshModels(auth.access!, await projectFor(auth));
+    const project = await projectFor(auth);
+    const ids = await refreshModels(auth.access!, project);
     if (!ids) return;
-    const changed = JSON.stringify(ids) !== JSON.stringify(catalog);
-    catalog = ids;
-    if (changed) await ctx.provider.reload();
+    const changed = JSON.stringify(ids) !== JSON.stringify(catalogs.get(project));
+    catalogs.set(project, ids);
+    if (changed && project === activeProject && !disposed) await ctx.provider.reload();
   };
-  let modelsSynced = false;
+  const syncedProjects = new Set<string>();
 
   if (typeof ctx.event?.subscribe === "function") {
     const stream = ctx.event.subscribe({ signal: eventAbort.signal });
@@ -276,14 +290,15 @@ export async function setup(ctx: V2Context): Promise<Plugin.Cleanup> {
   await ctx.session.hook(
     "http.request",
     async (event) => {
-      if (!isGenerativeLanguageRequest(event.request)) return;
+      if (disposed || !isGenerativeLanguageRequest(event.request)) return;
       const session = await activeSession(ctx);
       const auth = session?.auth;
       if (!session || !auth?.access) return; // API key connection: leave the request alone
       const projectId = await projectFor(auth);
-      if (!catalog) await syncModels(auth).catch(() => {});
-      else if (!modelsSynced) void syncModels(auth).catch(() => {});
-      modelsSynced = true;
+      if (!catalogs.has(projectId)) await syncModels(auth).catch(() => {});
+      else if (!syncedProjects.has(projectId)) void syncModels(auth).catch(() => {});
+      syncedProjects.add(projectId);
+      const catalog = catalogs.get(projectId);
 
       const original = event.request;
       const body =
@@ -346,7 +361,7 @@ export async function setup(ctx: V2Context): Promise<Plugin.Cleanup> {
     "http.response",
     async (event) => {
       const snapshot = requests.get(event.request);
-      if (!snapshot) return;
+      if (!snapshot || disposed) return;
       requests.delete(event.request);
 
       if (event.response.status === 401 && !snapshot.replayed) {
@@ -397,7 +412,7 @@ export async function setup(ctx: V2Context): Promise<Plugin.Cleanup> {
   await ctx.session.hook(
     "retry",
     async (event) => {
-      if (!oauthActive) return;
+      if (disposed || !oauthActive) return;
       if (event.attempt >= DEFAULT_MAX_ATTEMPTS) {
         event.decision = { retry: false };
         return;
@@ -470,7 +485,9 @@ export async function setup(ctx: V2Context): Promise<Plugin.Cleanup> {
   }
 
   return () => {
+    disposed = true;
     eventAbort.abort();
+    recentFailures.clear();
   };
 }
 
