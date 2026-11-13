@@ -85,6 +85,12 @@ const catalogs = new Map<string, string[]>();
 const projectByToken = new Map<string, string>();
 /** Only used when OpenCode hands over an already expired credential. */
 const fallbackAuth = new Map<string, OAuthAuthDetails>();
+/**
+ * Requests this plugin rewrote. Process-wide like the Anthropic plugin's ownership set:
+ * OpenCode can dispose and set the plugin up again while a request is in flight, and its
+ * response must still be unwrapped from the Antigravity envelope.
+ */
+const requests = new WeakMap<Request, Snapshot>();
 
 function toCredential(result: TokenExchangeResult): Credential.OAuth {
   if (result.type !== "success") throw new Error(result.error);
@@ -184,7 +190,6 @@ export async function setup(ctx: V2Context): Promise<Plugin.Cleanup> {
   if (ctx.storage) useCacheStorage(ctx.storage);
   void checkUpstreamUpdate((message) => console.warn(`[leprota.google-auth] ${message}`));
 
-  const requests = new WeakMap<Request, Snapshot>();
   const recentFailures = new Map<string, RecentFailure>();
   const eventAbort = new AbortController();
   let oauthActive = false;
@@ -360,13 +365,13 @@ export async function setup(ctx: V2Context): Promise<Plugin.Cleanup> {
     "http.response",
     async (event) => {
       const snapshot = requests.get(event.request);
-      if (!snapshot || disposed) return;
+      if (!snapshot) return;
       requests.delete(event.request);
 
       if (event.response.status === 401 && !snapshot.replayed) {
         // Access token revoked early: refresh once and replay.
         snapshot.replayed = true;
-        await event.response.body?.cancel().catch(() => {});
+        void event.response.body?.cancel().catch(() => {});
         const next = await refreshAuth(snapshot.auth, async (refreshed) => {
           fallbackAuth.set(snapshot.authKey, refreshed);
         });

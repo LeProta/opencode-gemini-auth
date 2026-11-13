@@ -50,8 +50,11 @@ export function normalizeThinkingConfig(
   const budgetEnabled = effectiveBudget !== undefined && (effectiveBudget > 0 || effectiveBudget === -1);
   const levelEnabled =
     effectiveLevel !== undefined && effectiveLevel !== "none" && effectiveLevel !== "off";
-  const thinkingEnabled = budgetEnabled || levelEnabled;
-  const finalIncludeThoughts = thinkingEnabled ? includeThoughts ?? false : false;
+  // Off only when the caller turned thinking off (budget 0, level none/off). A caller
+  // that names no budget or level leaves the model's default thinking on, and one
+  // that does not mention includeThoughts leaves that choice to withThoughts().
+  const thinkingOff = (effectiveBudget !== undefined || effectiveLevel !== undefined) && !budgetEnabled && !levelEnabled;
+  const finalIncludeThoughts = thinkingOff ? false : includeThoughts;
 
   const normalized: ThinkingConfig = {};
   if (effectiveBudget !== undefined) {
@@ -60,7 +63,9 @@ export function normalizeThinkingConfig(
   if (effectiveLevel !== undefined) {
     normalized.thinkingLevel = effectiveLevel;
   }
-  normalized.includeThoughts = finalIncludeThoughts;
+  if (finalIncludeThoughts !== undefined) {
+    normalized.includeThoughts = finalIncludeThoughts;
+  }
 
   return normalized;
 }

@@ -229,4 +229,54 @@ describe("Google OAuth on the built-in provider", () => {
     };
     expect(hooks.get("http.request")!(event)).rejects.toThrow("not available with your Google subscription");
   });
+
+  it("asks for the reasoning the request wants, with or without a level", async () => {
+    const { ctx, hooks } = fakeContext(subscription);
+    await setup(ctx);
+    const sent = async (model: string, thinkingConfig: unknown) => {
+      const event = {
+        model: { id: model },
+        request: new Request(`https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse`, {
+          method: "POST",
+          body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "hi" }] }], generationConfig: { thinkingConfig } }),
+        }),
+      };
+      await hooks.get("http.request")!(event);
+      return (await event.request.json()).request.generationConfig.thinkingConfig;
+    };
+    // OpenCode's default for Gemini 2.5: thoughts on, no budget.
+    expect(await sent("gemini-2.5-pro", { includeThoughts: true })).toEqual({ includeThoughts: true, thinkingBudget: -1 });
+    // A variant that only names its level still gets its reasoning shown.
+    expect(await sent("gemini-3.8-flash", { thinkingLevel: "low" })).toEqual({ thinkingLevel: "low", includeThoughts: true });
+    // An explicit opt-out stays off.
+    expect(await sent("gemini-3.8-flash", { thinkingLevel: "low", includeThoughts: false })).toEqual({
+      thinkingLevel: "low",
+      includeThoughts: false,
+    });
+  });
+
+  it("unwraps a response that arrives after the plugin was set up again", async () => {
+    const first = fakeContext(subscription);
+    const dispose = await setup(first.ctx);
+    const event = {
+      model: { id: "gemini-3-flash" },
+      request: new Request("https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash:generateContent", {
+        method: "POST",
+        body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "hi" }] }] }),
+      }),
+    };
+    await first.hooks.get("http.request")!(event);
+    await dispose?.();
+    const second = fakeContext(subscription);
+    await setup(second.ctx);
+
+    const envelope = () =>
+      new Response('{"response":{"candidates":[{"content":{"parts":[{"text":"ok"}]}}]},"traceId":"t"}', {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    const viaNewSetup = { ...event, response: envelope() };
+    await second.hooks.get("http.response")!(viaNewSetup);
+    expect((await viaNewSetup.response.json()).candidates[0].content.parts[0].text).toBe("ok");
+  });
 });

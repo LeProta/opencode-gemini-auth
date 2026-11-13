@@ -89,8 +89,16 @@ describe("enhanceGeminiErrorResponse", () => {
 });
 
 describe("normalizeThinkingConfig", () => {
-  it("forces includeThoughts to false when thinking is not enabled", () => {
-    expect(normalizeThinkingConfig({ includeThoughts: true })).toEqual({ includeThoughts: false });
+  it("keeps the caller's includeThoughts when no budget or level turns thinking off", () => {
+    expect(normalizeThinkingConfig({ includeThoughts: true })).toEqual({ includeThoughts: true });
+    expect(normalizeThinkingConfig({ includeThoughts: false })).toEqual({ includeThoughts: false });
+    // Not mentioned: left out, so withThoughts() decides.
+    expect(normalizeThinkingConfig({ thinkingLevel: "high" })).toEqual({ thinkingLevel: "high" });
+    expect(normalizeThinkingConfig({ thinkingBudget: 2048 })).toEqual({ thinkingBudget: 2048 });
+  });
+
+  it("forces includeThoughts to false when thinking is turned off", () => {
+    expect(normalizeThinkingConfig({ thinkingBudget: 0 })).toEqual({ thinkingBudget: 0, includeThoughts: false });
     expect(normalizeThinkingConfig({ thinkingBudget: 0, includeThoughts: true })).toEqual({
       thinkingBudget: 0,
       includeThoughts: false,
