@@ -47,6 +47,18 @@ describe("refreshAuth", () => {
     await expect(refreshAuth(auth, async () => {})).rejects.toThrow("invalid token response");
   });
 
+  it("sends one token request for concurrent callers and lets each one persist its own copy", async () => {
+    const calls = tokenEndpoint(200, '{"access_token":"fresh","expires_in":3600}');
+    const saved: string[] = [];
+    const [a, b] = await Promise.all([
+      refreshAuth({ ...auth, refresh: "rt-c|proj-a" }, async (next) => void saved.push(`a:${next.access}:${next.refresh}`)),
+      refreshAuth({ ...auth, refresh: "rt-c|proj-b" }, async (next) => void saved.push(`b:${next.access}:${next.refresh}`)),
+    ]);
+    expect(calls.length).toBe(1);
+    expect(saved.sort()).toEqual(["a:fresh:rt-c|proj-a|", "b:fresh:rt-c|proj-b|"]);
+    expect([a.refresh, b.refresh]).toEqual(["rt-c|proj-a|", "rt-c|proj-b|"]);
+  });
+
   it("keeps the project id, refuses redirects and never echoes the raw error body", async () => {
     const calls = tokenEndpoint(200, '{"access_token":"new","expires_in":3600}');
     const next = await refreshAuth(auth, async () => {});

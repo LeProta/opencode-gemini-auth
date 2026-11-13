@@ -102,42 +102,50 @@ export async function exchangeCode(code: string): Promise<TokenExchangeResult> {
   }
 }
 
-const refreshInFlight = new Map<string, Promise<OAuthAuthDetails>>();
+const refreshInFlight = new Map<string, Promise<TokenResponse>>();
 
-/** Single-flight refresh per refresh token; persists the new access token. */
-export function refreshAuth(
+/**
+ * One token request per refresh token at a time; every caller then builds and
+ * persists its own copy, so a caller that joined an in-flight refresh still
+ * records the new token.
+ */
+export async function refreshAuth(
   auth: OAuthAuthDetails,
   persist: (auth: OAuthAuthDetails) => Promise<void>,
 ): Promise<OAuthAuthDetails> {
   const parts = parseRefreshParts(auth.refresh);
-  const pending = refreshInFlight.get(parts.refreshToken);
-  if (pending) return pending;
-  const run = (async () => {
-    let res: { status: number; text: string };
-    try {
-      res = await postTokenForm(tokenRefreshForm(parts.refreshToken));
-    } catch (error) {
-      throw new Error(`Google token refresh failed: ${error instanceof Error ? error.message : String(error)}`);
-    }
-    if (res.status === 400 || res.status === 401) {
-      throw new Error(
-        `Google refresh token rejected (${oauthErrorCode(res.text)}). Sign in again with \`opencode auth login google --method antigravity\`.`,
-      );
-    }
-    if (res.status < 200 || res.status >= 300) {
-      throw new Error(`Google token refresh failed (${res.status} ${oauthErrorCode(res.text)})`);
-    }
-    const tokens = parseTokenResponse(res.text);
-    if (!tokens) throw new Error("Google token refresh returned an invalid token response");
-    const next: OAuthAuthDetails = {
-      ...auth,
-      access: tokens.access,
-      expires: tokens.expires,
-      refresh: formatRefreshParts({ ...parts, refreshToken: tokens.refresh ?? parts.refreshToken }),
-    };
-    await persist(next);
-    return next;
-  })().finally(() => refreshInFlight.delete(parts.refreshToken));
-  refreshInFlight.set(parts.refreshToken, run);
-  return run;
+  let run = refreshInFlight.get(parts.refreshToken);
+  if (!run) {
+    run = requestRefresh(parts.refreshToken).finally(() => refreshInFlight.delete(parts.refreshToken));
+    refreshInFlight.set(parts.refreshToken, run);
+  }
+  const tokens = await run;
+  const next: OAuthAuthDetails = {
+    ...auth,
+    access: tokens.access,
+    expires: tokens.expires,
+    refresh: formatRefreshParts({ ...parts, refreshToken: tokens.refresh ?? parts.refreshToken }),
+  };
+  await persist(next);
+  return next;
+}
+
+async function requestRefresh(refreshToken: string): Promise<TokenResponse> {
+  let res: { status: number; text: string };
+  try {
+    res = await postTokenForm(tokenRefreshForm(refreshToken));
+  } catch (error) {
+    throw new Error(`Google token refresh failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (res.status === 400 || res.status === 401) {
+    throw new Error(
+      `Google refresh token rejected (${oauthErrorCode(res.text)}). Sign in again with \`opencode auth login google --method antigravity\`.`,
+    );
+  }
+  if (res.status < 200 || res.status >= 300) {
+    throw new Error(`Google token refresh failed (${res.status} ${oauthErrorCode(res.text)})`);
+  }
+  const tokens = parseTokenResponse(res.text);
+  if (!tokens) throw new Error("Google token refresh returned an invalid token response");
+  return tokens;
 }
