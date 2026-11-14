@@ -33,11 +33,14 @@ export function toAntigravityRequest(
   project: string,
   version: string,
 ): { url: string; init: RequestInit } {
-  const headers = new Headers(init.headers);
-  headers.set("User-Agent", userAgents(version).short);
-  headers.delete("x-activity-request-id"); // Gemini CLI fingerprint, not sent by Antigravity
-  // The body was rewritten: these described the caller's body, not ours.
-  for (const name of STALE_BODY_HEADERS) headers.delete(name);
+  // The request is rebuilt from the client profile: CLIProxyAPI's Antigravity request carries
+  // these three headers, plus Accept for SSE. Whatever the host or its SDK added (their own
+  // User-Agent, x-goog-api-client, headers describing the body before the rewrite) stays here.
+  const headers = new Headers({ "User-Agent": userAgents(version).short });
+  const authorization = new Headers(init.headers).get("Authorization");
+  if (authorization) headers.set("Authorization", authorization);
+  if (init.body != null) headers.set("Content-Type", "application/json");
+  if (url.includes("alt=sse")) headers.set("Accept", "text/event-stream");
 
   const action = url.match(/v1internal:(\w+)/)?.[1];
   let body = init.body;
@@ -55,7 +58,6 @@ export function toAntigravityRequest(
   return { url: target, init: { ...init, headers, body, redirect: "error" } };
 }
 
-const STALE_BODY_HEADERS = ["content-length", "content-encoding", "content-md5", "content-digest", "digest", "etag"];
 const TRUSTED_ORIGINS = new Set([API.dailyBase, API.prodBase]);
 
 /** The bearer token only ever goes to the two Cloud Code hosts. */
