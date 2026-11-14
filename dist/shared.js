@@ -81,6 +81,136 @@ async function readResponseText(response, limit, label, signal) {
   return readBoundedText(response.body, limit, label, signal);
 }
 
+// src/wire.ts
+import { createHash, randomBytes, randomUUID } from "crypto";
+var DEFAULT_VERSION = "2.29.0";
+var HUB_PLATFORM = "os_type=darwin; arch=arm64";
+var NODE_API_CLIENT_UA = "google-api-nodejs-client/10.3.0";
+var GOOG_API_CLIENT = "gl-node/22.21.1";
+var HUB_CHANGELISTS = {
+  "2.23.0": "998057262",
+  "2.24.0": "1000335682",
+  "2.29.0": "1013060670"
+};
+var TOKEN_USER_AGENT = "Go-http-client/2.0";
+function userAgents(version) {
+  const cl = HUB_CHANGELISTS[version];
+  const short = `antigravity/hub/${version} (aidev_client; ${HUB_PLATFORM}${cl ? `; cl=${cl}` : ""})`;
+  return {
+    /** generate / stream / loadCodeAssist / fetchAvailableModels / quota */
+    short,
+    /** onboardUser */
+    long: `${short} ${NODE_API_CLIENT_UA}`
+  };
+}
+function onboardBody(tierId, version) {
+  return {
+    tier_id: tierId,
+    metadata: { ide_type: "ANTIGRAVITY", ide_version: version, ide_name: "antigravity" }
+  };
+}
+function defaultTierId(loadResp) {
+  const tiers = Array.isArray(loadResp?.allowedTiers) ? loadResp.allowedTiers : [];
+  const preferred = tiers.find((t) => t?.isDefault === true && typeof t.id === "string" && t.id.trim());
+  if (preferred) return preferred.id.trim();
+  const current = loadResp?.currentTier?.id;
+  return typeof current === "string" && current.trim() ? current.trim() : "free-tier";
+}
+function stableSessionId(contents) {
+  for (const content of Array.isArray(contents) ? contents : []) {
+    if (content?.role !== "user") continue;
+    const text = content?.parts?.[0]?.text;
+    if (typeof text !== "string" || !text) continue;
+    const value = createHash("sha256").update(text).digest().readBigUInt64BE(0) & 0x7fffffffffffffffn;
+    return `-${value}`;
+  }
+  return `-${randomBytes(8).readBigUInt64BE(0) & 0x7fffffffffffffffn}`;
+}
+function antigravityEnvelope(model, project, geminiRequest) {
+  const { toolConfig: topToolConfig, ...rest } = geminiRequest;
+  const request = { ...rest };
+  if (topToolConfig && !request.toolConfig) request.toolConfig = topToolConfig;
+  delete request.safetySettings;
+  const isImage = model.includes("image");
+  const isClaude = model.includes("claude");
+  if (isClaude) {
+    request.toolConfig = {
+      ...request.toolConfig,
+      functionCallingConfig: { ...request.toolConfig?.functionCallingConfig, mode: "VALIDATED" }
+    };
+  } else if (request.generationConfig) {
+    const { maxOutputTokens: _dropped, ...generationConfig } = request.generationConfig;
+    request.generationConfig = generationConfig;
+  }
+  const envelope = {
+    model,
+    userAgent: "antigravity",
+    requestType: isImage ? "image_gen" : "agent"
+  };
+  if (project) envelope.project = project;
+  if (isImage) {
+    envelope.requestId = `image_gen/${Date.now()}/${randomUUID()}/12`;
+  } else {
+    envelope.requestId = `agent-${randomUUID()}`;
+    if (!request.sessionId) request.sessionId = stableSessionId(request.contents);
+  }
+  envelope.request = request;
+  return envelope;
+}
+
+// src/config.ts
+var VERSION_OVERRIDE_ENV = "OPENCODE_ANTIGRAVITY_VERSION";
+var VERSION_PATTERN = /^(0|[1-9]\d{0,5})\.(0|[1-9]\d{0,5})\.(0|[1-9]\d{0,5})$/;
+var overrideWarned = false;
+function versionOverride(raw = process.env[VERSION_OVERRIDE_ENV]) {
+  if (raw === void 0 || raw.trim() === "") return void 0;
+  const value = raw.trim();
+  if (VERSION_PATTERN.test(value)) return value;
+  if (!overrideWarned) {
+    overrideWarned = true;
+    console.error(`[leprota.google-auth] ${VERSION_OVERRIDE_ENV} must look like 2.31.2; using ${DEFAULT_VERSION} instead.`);
+  }
+  return void 0;
+}
+function currentVersion() {
+  return versionOverride() ?? DEFAULT_VERSION;
+}
+
+// src/constants.ts
+var GEMINI_CODE_ASSIST_ENDPOINT = "https://cloudcode-pa.googleapis.com";
+var ANTIGRAVITY_CODE_REDIRECT_URI = "https://antigravity.google/oauth-callback";
+
+// src/fetch.ts
+function geminiFetch(input, init) {
+  const proxy = process.env.OPENCODE_GEMINI_AUTH_PROXY;
+  if (!proxy) {
+    return fetch(input, init);
+  }
+  return fetch(input, {
+    ...init ?? {},
+    proxy
+  });
+}
+var MAX_UPSTREAM_JSON_BYTES = 4 * 1024 * 1024;
+async function upstreamJson(url, { token, ua, body, method = "POST", timeoutMs = 15e3, extraHeaders }) {
+  const headers = { "Content-Type": "application/json", Accept: "*/*", "User-Agent": ua, ...extraHeaders };
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const res = await geminiFetch(url, {
+    method,
+    headers,
+    body: body === void 0 ? void 0 : JSON.stringify(body),
+    redirect: "error",
+    signal: AbortSignal.timeout(timeoutMs)
+  });
+  const text = await readResponseText(res, MAX_UPSTREAM_JSON_BYTES, "Google API response");
+  let json = null;
+  try {
+    json = JSON.parse(text);
+  } catch {
+  }
+  return { status: res.status, text, json };
+}
+
 // src/cache.ts
 import { mkdir, readFile, writeFile } from "fs/promises";
 import { join as join2 } from "path";
@@ -162,39 +292,8 @@ function writeCache(patch) {
   return writes;
 }
 
-// src/fetch.ts
-function geminiFetch(input, init) {
-  const proxy = process.env.OPENCODE_GEMINI_AUTH_PROXY;
-  if (!proxy) {
-    return fetch(input, init);
-  }
-  return fetch(input, {
-    ...init ?? {},
-    proxy
-  });
-}
-var MAX_UPSTREAM_JSON_BYTES = 4 * 1024 * 1024;
-async function upstreamJson(url, { token, ua, body, method = "POST", timeoutMs = 15e3, extraHeaders }) {
-  const headers = { "Content-Type": "application/json", Accept: "*/*", "User-Agent": ua, ...extraHeaders };
-  if (token) headers.Authorization = `Bearer ${token}`;
-  const res = await geminiFetch(url, {
-    method,
-    headers,
-    body: body === void 0 ? void 0 : JSON.stringify(body),
-    redirect: "error",
-    signal: AbortSignal.timeout(timeoutMs)
-  });
-  const text = await readResponseText(res, MAX_UPSTREAM_JSON_BYTES, "Google API response");
-  let json = null;
-  try {
-    json = JSON.parse(text);
-  } catch {
-  }
-  return { status: res.status, text, json };
-}
-
 // src/vendor/protocol.js
-import { randomUUID, createHash } from "crypto";
+import { randomUUID as randomUUID2, createHash as createHash2 } from "crypto";
 var CLIENT_ID_B64 = "MTA3MTAwNjA2MDU5MS10bWhzc2luMmgyMWxjcmUyMzV2dG9sb2poNGc0MDNlcC5hcHBzLmdvb2dsZXVzZXJjb250ZW50LmNvbQ==";
 var CLIENT_SECRET_B64 = "R09DU1BYLUs1OEZXUjQ4NkxkTEoxbUxCOHNYQzR6NnFEQWY=";
 var OAUTH = {
@@ -224,12 +323,6 @@ var API = {
   fetchModelsPath: "/v1internal:fetchAvailableModels",
   countTokensPath: "/v1internal:countTokens",
   quotaSummaryPath: "/v1internal:retrieveUserQuotaSummary"
-};
-var VERSION = {
-  manifestUrl: "https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/manifest/latest-arm64-mac.yml",
-  fallback: "2.9.1",
-  hubPlatform: "darwin/arm64",
-  nodeApiClientUA: "google-api-nodejs-client/10.3.0"
 };
 function callbackUrl() {
   return `http://localhost:${OAUTH.callbackPort}${OAUTH.callbackPath}`;
@@ -262,12 +355,6 @@ function tokenRefreshForm(refreshToken) {
     grant_type: "refresh_token",
     refresh_token: refreshToken
   });
-}
-function parseVersionManifest(text) {
-  if (typeof text !== "string") return null;
-  const m = text.match(/^version:\s*("?)(\d+\.\d+\.\d+)\1\s*$/m);
-  if (!m) return null;
-  return m[2];
 }
 function firstNumber(source, keys) {
   for (const key of keys) {
@@ -346,143 +433,6 @@ function splitEffortModelId(id) {
   return { baseId: m[1], effort: m[2] };
 }
 
-// src/wire.ts
-import { createHash as createHash2, randomBytes, randomUUID as randomUUID2 } from "crypto";
-var FALLBACK_VERSION = "2.29.0";
-var HUB_PLATFORM = "os_type=darwin; arch=arm64";
-var NODE_API_CLIENT_UA = "google-api-nodejs-client/10.3.0";
-var GOOG_API_CLIENT = "gl-node/22.21.1";
-var HUB_CHANGELISTS = {
-  "2.23.0": "998057262",
-  "2.24.0": "1000335682",
-  "2.29.0": "1013060670"
-};
-var TOKEN_USER_AGENT = "Go-http-client/2.0";
-function userAgents(version) {
-  const cl = HUB_CHANGELISTS[version];
-  const short = `antigravity/hub/${version} (aidev_client; ${HUB_PLATFORM}${cl ? `; cl=${cl}` : ""})`;
-  return {
-    /** generate / stream / loadCodeAssist / fetchAvailableModels / quota */
-    short,
-    /** onboardUser */
-    long: `${short} ${NODE_API_CLIENT_UA}`
-  };
-}
-function onboardBody(tierId, version) {
-  return {
-    tier_id: tierId,
-    metadata: { ide_type: "ANTIGRAVITY", ide_version: version, ide_name: "antigravity" }
-  };
-}
-function defaultTierId(loadResp) {
-  const tiers = Array.isArray(loadResp?.allowedTiers) ? loadResp.allowedTiers : [];
-  const preferred = tiers.find((t) => t?.isDefault === true && typeof t.id === "string" && t.id.trim());
-  if (preferred) return preferred.id.trim();
-  const current = loadResp?.currentTier?.id;
-  return typeof current === "string" && current.trim() ? current.trim() : "free-tier";
-}
-function stableSessionId(contents) {
-  for (const content of Array.isArray(contents) ? contents : []) {
-    if (content?.role !== "user") continue;
-    const text = content?.parts?.[0]?.text;
-    if (typeof text !== "string" || !text) continue;
-    const value = createHash2("sha256").update(text).digest().readBigUInt64BE(0) & 0x7fffffffffffffffn;
-    return `-${value}`;
-  }
-  return `-${randomBytes(8).readBigUInt64BE(0) & 0x7fffffffffffffffn}`;
-}
-function antigravityEnvelope(model, project, geminiRequest) {
-  const { toolConfig: topToolConfig, ...rest } = geminiRequest;
-  const request = { ...rest };
-  if (topToolConfig && !request.toolConfig) request.toolConfig = topToolConfig;
-  delete request.safetySettings;
-  const isImage = model.includes("image");
-  const isClaude = model.includes("claude");
-  if (isClaude) {
-    request.toolConfig = {
-      ...request.toolConfig,
-      functionCallingConfig: { ...request.toolConfig?.functionCallingConfig, mode: "VALIDATED" }
-    };
-  } else if (request.generationConfig) {
-    const { maxOutputTokens: _dropped, ...generationConfig } = request.generationConfig;
-    request.generationConfig = generationConfig;
-  }
-  const envelope = {
-    model,
-    userAgent: "antigravity",
-    requestType: isImage ? "image_gen" : "agent"
-  };
-  if (project) envelope.project = project;
-  if (isImage) {
-    envelope.requestId = `image_gen/${Date.now()}/${randomUUID2()}/12`;
-  } else {
-    envelope.requestId = `agent-${randomUUID2()}`;
-    if (!request.sessionId) request.sessionId = stableSessionId(request.contents);
-  }
-  envelope.request = request;
-  return envelope;
-}
-
-// src/config.ts
-var VERSION_TTL_MS = 6 * 60 * 60 * 1e3;
-var VERSION_MEMO_MS = 10 * 60 * 1e3;
-var versionMemo;
-function currentVersion() {
-  if (!versionMemo || Date.now() > versionMemo.expires) {
-    versionMemo = { value: loadVersion(), expires: Date.now() + VERSION_MEMO_MS };
-  }
-  return versionMemo.value;
-}
-var VERSION_OVERRIDE_ENV = "OPENCODE_ANTIGRAVITY_VERSION";
-var VERSION_PATTERN = /^(0|[1-9]\d{0,5})\.(0|[1-9]\d{0,5})\.(0|[1-9]\d{0,5})$/;
-var isVersion = (value) => typeof value === "string" && VERSION_PATTERN.test(value);
-var overrideWarned = false;
-function versionOverride(raw = process.env[VERSION_OVERRIDE_ENV]) {
-  if (raw === void 0 || raw.trim() === "") return void 0;
-  const value = raw.trim();
-  if (isVersion(value)) return value;
-  if (!overrideWarned) {
-    overrideWarned = true;
-    console.error(`[leprota.google-auth] ${VERSION_OVERRIDE_ENV} must look like 2.31.2; using the live Antigravity version instead.`);
-  }
-  return void 0;
-}
-async function loadVersion() {
-  const forced = versionOverride();
-  if (forced) return forced;
-  const now = Date.now();
-  const cache = await readCache();
-  const cacheAge = now - (cache.versionFetchedAt ?? 0);
-  const cached = isVersion(cache.version) ? cache.version : void 0;
-  if (cached && cacheAge < VERSION_TTL_MS) return cached;
-  const live = fetchLiveVersion(now);
-  if (cached && cacheAge < VERSION_TTL_MS * 4) {
-    void live.then((version) => {
-      if (version) versionMemo = void 0;
-    });
-    return cached;
-  }
-  return await live ?? FALLBACK_VERSION;
-}
-async function fetchLiveVersion(now) {
-  try {
-    const res = await geminiFetch(VERSION.manifestUrl, {
-      headers: { "User-Agent": "electron-builder", "Cache-Control": "no-cache" },
-      signal: AbortSignal.timeout(1e4)
-    });
-    const version = res.status === 200 ? parseVersionManifest(await readResponseText(res, 64 * 1024, "Antigravity version manifest")) : null;
-    if (!isVersion(version)) return null;
-    await writeCache({ version, versionFetchedAt: now });
-    return version;
-  } catch {
-    return null;
-  }
-}
-
-// src/constants.ts
-var GEMINI_CODE_ASSIST_ENDPOINT = "https://cloudcode-pa.googleapis.com";
-var ANTIGRAVITY_CODE_REDIRECT_URI = "https://antigravity.google/oauth-callback";
-
 // src/models.ts
 var EFFORT_ORDER = ["high", "medium", "low"];
 function upstreamModelFor(id, available, level) {
@@ -510,7 +460,7 @@ function isPublishableModelId(id) {
   return !!id && !/^(chat_|tab_)/.test(id);
 }
 async function refreshModels(accessToken, project) {
-  const ua = userAgents(await currentVersion());
+  const ua = userAgents(currentVersion());
   for (const base of [API.prodBase, API.dailyBase]) {
     try {
       const res = await upstreamJson(`${base}${API.fetchModelsPath}`, {
@@ -915,7 +865,7 @@ function extractProject(data) {
   return "";
 }
 async function resolveProject(accessToken) {
-  const version = await currentVersion();
+  const version = currentVersion();
   const ua = userAgents(version);
   const load = await upstreamJson(`${API.dailyBase}${API.loadCodeAssistPath}`, {
     token: accessToken,
@@ -1047,7 +997,7 @@ async function exchangeCode(code, verifier) {
     if (!tokens.refresh) return { type: "failed", error: "Missing refresh token in response" };
     let email;
     try {
-      const ua = userAgents(await currentVersion()).short;
+      const ua = userAgents(currentVersion()).short;
       const info = await upstreamJson(OAUTH.userinfoEndpoint, { method: "GET", token: tokens.access, ua });
       if (typeof info.json?.email === "string") email = info.json.email;
     } catch {
@@ -1107,7 +1057,7 @@ async function requestRefresh(refreshToken) {
 
 // src/quota.ts
 async function fetchQuotaSummary(accessToken, project) {
-  const ua = userAgents(await currentVersion());
+  const ua = userAgents(currentVersion());
   for (const base of [API.dailyBase, API.prodBase]) {
     try {
       const res = await upstreamJson(`${base}${API.quotaSummaryPath}`, {
@@ -1185,50 +1135,6 @@ function isTrustedGoogleUrl(input) {
     return url.username === "" && url.password === "" && TRUSTED_ORIGINS.has(url.origin);
   } catch {
     return false;
-  }
-}
-
-// src/upstream.ts
-var CLIPROXY_UPSTREAM = {
-  repo: "router-for-me/CLIProxyAPI",
-  files: {
-    "internal/misc/antigravity_version.go": "f72f8bfd6a1c7d69ca371dd4a7bdf490db50c154",
-    "internal/auth/antigravity/constants.go": "7c627ffbdb4acff7107e05e4416e45c15a003d50",
-    "internal/auth/antigravity/auth.go": "02e9e85204052dfed9bf73b7075c7b414111a4b3",
-    "internal/runtime/executor/antigravity_executor_request.go": "cc95661ce438a528fa7283bf93f7dbf684d1e3fe"
-  }
-};
-var UPDATE_CHECK_TTL_MS = 24 * 60 * 60 * 1e3;
-var updateChecked = false;
-async function checkUpstreamUpdate(notify) {
-  if (process.env.OPENCODE_ANTIGRAVITY_UPDATE_CHECK === "0" || updateChecked) return;
-  updateChecked = true;
-  const { repo, files } = CLIPROXY_UPSTREAM;
-  const cache = await readCache();
-  let latest = cache.upstreamShas;
-  if (Date.now() - (cache.updateCheckedAt ?? 0) >= UPDATE_CHECK_TTL_MS) {
-    try {
-      const entries = await Promise.all(
-        Object.keys(files).map(async (path) => {
-          const res = await geminiFetch(`https://api.github.com/repos/${repo}/commits?path=${path}&per_page=1`, {
-            headers: { "User-Agent": "opencode-gemini-auth", Accept: "application/vnd.github+json" },
-            signal: AbortSignal.timeout(5e3)
-          });
-          if (!res.ok) throw new Error(`GitHub ${res.status}`);
-          const [commit] = JSON.parse(await readResponseText(res, 256 * 1024, "GitHub commit list"));
-          return [path, commit?.sha ?? ""];
-        })
-      );
-      latest = Object.fromEntries(entries);
-      await writeCache({ updateCheckedAt: Date.now(), upstreamShas: latest });
-    } catch {
-    }
-  }
-  const changed = Object.entries(files).filter(([path, reviewed]) => latest?.[path] && latest[path] !== reviewed).map(([path]) => path.split("/").pop());
-  if (changed.length) {
-    notify(
-      `${repo} changed its Antigravity protocol files (${changed.join(", ")}). Run \`npm run check:cliproxy\` in the plugin repo, port the diff into src/wire.ts, then accept.`
-    );
   }
 }
 
@@ -2971,7 +2877,6 @@ async function quotaReport(ctx) {
 }
 async function setup(ctx) {
   if (ctx.storage) useCacheStorage(ctx.storage);
-  void checkUpstreamUpdate((message) => console.warn(`[leprota.google-auth] ${message}`));
   const recentFailures = /* @__PURE__ */ new Map();
   const eventAbort = new AbortController();
   let oauthActive = false;
@@ -3085,7 +2990,7 @@ async function setup(ctx) {
         auth.access,
         projectId
       );
-      const target = toAntigravityRequest(String(prepared.request), prepared.init, projectId, await currentVersion());
+      const target = toAntigravityRequest(String(prepared.request), prepared.init, projectId, currentVersion());
       const throttleKey = buildRetryThrottleKey(target.url, target.init);
       await waitForRetryCooldown(throttleKey, original.signal);
       const debugContext = startGeminiDebugRequest({
