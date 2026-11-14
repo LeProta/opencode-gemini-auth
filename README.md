@@ -41,6 +41,10 @@ forever; a sign-in left unfinished kept the callback port for 5 minutes; reasoni
 turned off when the request asked for it without a level or budget; two cache writes
 made together lost one; a response arriving after a plugin reload stayed wrapped; the
 first request of the day waited for Google's version manifest. The sign-in now uses PKCE.
+A refresh token Google refuses with `invalid_grant` (expired or revoked) is not sent
+again until OpenCode restarts or you sign in again; network errors and other answers
+are still retried. Token answers that are not tokens (RFC 6749 Appendix A) or carry an
+unusable expiry are refused, and a token refresh no longer waits for the version manifest.
 
 ## Install
 
@@ -97,6 +101,9 @@ With an API key connected instead, the plugin leaves the Google provider alone.
 | `OPENCODE_GEMINI_AUTH_PROXY` | HTTP proxy for the plugin's own requests. |
 | `OPENCODE_GEMINI_DEBUG=1` | Logs each request's URL, status, timing, trace id, masked headers, the model mapping and the final `generationConfig` to the plugin's log directory. No prompt, answer or tool result. |
 | `OPENCODE_GEMINI_DEBUG_CONTENT=1` | With `OPENCODE_GEMINI_DEBUG=1`: also logs request and response body previews and a 4 KB raw response excerpt. These contain your prompts and answers (tokens stay redacted): turn it on only to diagnose a problem. |
+
+The log directory and its files are created for your user only (`0700` / `0600`) on
+Linux and macOS; on Windows they inherit the permissions of the OpenCode data directory.
 
 ## How it works
 
