@@ -19,13 +19,15 @@ export function currentVersion(): Promise<string> {
 
 export const VERSION_OVERRIDE_ENV = "OPENCODE_ANTIGRAVITY_VERSION";
 const VERSION_PATTERN = /^(0|[1-9]\d{0,5})\.(0|[1-9]\d{0,5})\.(0|[1-9]\d{0,5})$/;
+/** Every source of the reported version passes here: it is written into the User-Agent. */
+const isVersion = (value: unknown): value is string => typeof value === "string" && VERSION_PATTERN.test(value);
 let overrideWarned = false;
 
 /** A valid override wins over the manifest; a malformed one is ignored (and said so once). */
 export function versionOverride(raw = process.env[VERSION_OVERRIDE_ENV]): string | undefined {
   if (raw === undefined || raw.trim() === "") return undefined;
   const value = raw.trim();
-  if (VERSION_PATTERN.test(value)) return value;
+  if (isVersion(value)) return value;
   if (!overrideWarned) {
     overrideWarned = true;
     console.error(`[leprota.google-auth] ${VERSION_OVERRIDE_ENV} must look like 2.31.2; using the live Antigravity version instead.`);
@@ -39,15 +41,16 @@ async function loadVersion(): Promise<string> {
   const now = Date.now();
   const cache = await readCache();
   const cacheAge = now - (cache.versionFetchedAt ?? 0);
-  if (cache.version && cacheAge < VERSION_TTL_MS) return cache.version;
+  const cached = isVersion(cache.version) ? cache.version : undefined;
+  if (cached && cacheAge < VERSION_TTL_MS) return cached;
   const live = fetchLiveVersion(now);
-  if (cache.version && cacheAge < VERSION_TTL_MS * 4) {
+  if (cached && cacheAge < VERSION_TTL_MS * 4) {
     // Yesterday's version answers now; the manifest (up to 10 s when it is unreachable)
     // is read behind it instead of holding the first request of the day.
     void live.then((version) => {
       if (version) versionMemo = undefined;
     });
-    return cache.version;
+    return cached;
   }
   return (await live) ?? FALLBACK_VERSION;
 }
@@ -59,8 +62,9 @@ async function fetchLiveVersion(now: number): Promise<string | null> {
       signal: AbortSignal.timeout(10_000),
     });
     const version = res.status === 200 ? parseVersionManifest(await readResponseText(res, 64 * 1024, "Antigravity version manifest")) : null;
-    if (version) await writeCache({ version, versionFetchedAt: now });
-    return version ?? null;
+    if (!isVersion(version)) return null;
+    await writeCache({ version, versionFetchedAt: now });
+    return version;
   } catch {
     return null;
   }

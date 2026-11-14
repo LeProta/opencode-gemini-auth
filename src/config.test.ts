@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 
 import { writeCache } from "./cache";
 import { currentVersion, resetVersionForTests } from "./config";
+import { FALLBACK_VERSION, userAgents } from "./wire";
 
 const realFetch = globalThis.fetch;
 afterEach(() => {
@@ -41,5 +42,30 @@ describe("currentVersion", () => {
     globalThis.fetch = (async () => new Response("version: 2.31.6\n", { status: 200 })) as unknown as typeof fetch;
     resetVersionForTests();
     expect(await currentVersion()).toBe("2.31.6");
+  });
+
+  it("only reports a plain x.y.z, wherever the value comes from", async () => {
+    const manifest = (text: string) => {
+      globalThis.fetch = (async () => new Response(text, { status: 200 })) as unknown as typeof fetch;
+      resetVersionForTests();
+    };
+
+    // A stored value that would rewrite the User-Agent is not used, however fresh it looks.
+    for (const stored of ["2.32.1 (aidev_client; os_type=linux", "2.32.1\r\nX-Injected: 1", "latest", 2.32]) {
+      await writeCache({ version: stored as string, versionFetchedAt: Date.now() });
+      manifest("version: 2.31.7\n");
+      expect(await currentVersion()).toBe("2.31.7");
+    }
+
+    // Neither is a published value that is not a release number.
+    for (const published of ["02.31.7", "2.31.7000000", "2.31"]) {
+      await writeCache({ version: "", versionFetchedAt: 0 });
+      manifest(`version: ${published}\n`);
+      const version = await currentVersion();
+      expect(version).toBe(FALLBACK_VERSION);
+      expect(userAgents(version).short).toMatch(
+        /^antigravity\/hub\/\d+\.\d+\.\d+ \(aidev_client; os_type=darwin; arch=arm64(; cl=\d+)?\)$/,
+      );
+    }
   });
 });
