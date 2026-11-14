@@ -435,11 +435,12 @@ function currentVersion() {
 }
 var VERSION_OVERRIDE_ENV = "OPENCODE_ANTIGRAVITY_VERSION";
 var VERSION_PATTERN = /^(0|[1-9]\d{0,5})\.(0|[1-9]\d{0,5})\.(0|[1-9]\d{0,5})$/;
+var isVersion = (value) => typeof value === "string" && VERSION_PATTERN.test(value);
 var overrideWarned = false;
 function versionOverride(raw = process.env[VERSION_OVERRIDE_ENV]) {
   if (raw === void 0 || raw.trim() === "") return void 0;
   const value = raw.trim();
-  if (VERSION_PATTERN.test(value)) return value;
+  if (isVersion(value)) return value;
   if (!overrideWarned) {
     overrideWarned = true;
     console.error(`[leprota.google-auth] ${VERSION_OVERRIDE_ENV} must look like 2.31.2; using the live Antigravity version instead.`);
@@ -452,13 +453,14 @@ async function loadVersion() {
   const now = Date.now();
   const cache = await readCache();
   const cacheAge = now - (cache.versionFetchedAt ?? 0);
-  if (cache.version && cacheAge < VERSION_TTL_MS) return cache.version;
+  const cached = isVersion(cache.version) ? cache.version : void 0;
+  if (cached && cacheAge < VERSION_TTL_MS) return cached;
   const live = fetchLiveVersion(now);
-  if (cache.version && cacheAge < VERSION_TTL_MS * 4) {
+  if (cached && cacheAge < VERSION_TTL_MS * 4) {
     void live.then((version) => {
       if (version) versionMemo = void 0;
     });
-    return cache.version;
+    return cached;
   }
   return await live ?? FALLBACK_VERSION;
 }
@@ -469,8 +471,9 @@ async function fetchLiveVersion(now) {
       signal: AbortSignal.timeout(1e4)
     });
     const version = res.status === 200 ? parseVersionManifest(await readResponseText(res, 64 * 1024, "Antigravity version manifest")) : null;
-    if (version) await writeCache({ version, versionFetchedAt: now });
-    return version ?? null;
+    if (!isVersion(version)) return null;
+    await writeCache({ version, versionFetchedAt: now });
+    return version;
   } catch {
     return null;
   }
@@ -1157,10 +1160,11 @@ function withThoughts(model, request) {
   return { ...request, generationConfig: { ...generationConfig, thinkingConfig } };
 }
 function toAntigravityRequest(url, init, project, version) {
-  const headers = new Headers(init.headers);
-  headers.set("User-Agent", userAgents(version).short);
-  headers.delete("x-activity-request-id");
-  for (const name of STALE_BODY_HEADERS) headers.delete(name);
+  const headers = new Headers({ "User-Agent": userAgents(version).short });
+  const authorization = new Headers(init.headers).get("Authorization");
+  if (authorization) headers.set("Authorization", authorization);
+  if (init.body != null) headers.set("Content-Type", "application/json");
+  if (url.includes("alt=sse")) headers.set("Accept", "text/event-stream");
   const action = url.match(/v1internal:(\w+)/)?.[1];
   let body = init.body;
   if ((action === "generateContent" || action === "streamGenerateContent") && typeof body === "string") {
@@ -1174,7 +1178,6 @@ function toAntigravityRequest(url, init, project, version) {
   }
   return { url: target, init: { ...init, headers, body, redirect: "error" } };
 }
-var STALE_BODY_HEADERS = ["content-length", "content-encoding", "content-md5", "content-digest", "digest", "etag"];
 var TRUSTED_ORIGINS = /* @__PURE__ */ new Set([API.dailyBase, API.prodBase]);
 function isTrustedGoogleUrl(input) {
   try {
