@@ -33,8 +33,7 @@ If applicable, add screenshots to help explain your problem.
 
 ## Environment
 
-- OS: [e.g. iOS, Android, Windows, macOS, Linux]
-- Version: [e.g. 22]
+- Windows 11 version and build: [e.g. 24H2, build 26100]
 
 ## Opencode Information
 

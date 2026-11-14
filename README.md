@@ -22,6 +22,7 @@ they draw on the subscription quota, not on API credit.
 
 | Component | Verified with |
 |-----------|---------------|
+| Windows   | Windows 11 Pro 24H2 (build 26100), x64, Windows PowerShell 5.1. The only supported platform: macOS, Linux and WSL are not maintained or tested. |
 | OpenCode  | v2 plugin API (`plugins` key), desktop/CLI 2.2.7 |
 | Bun       | 1.4.4 (the runtime embedded in OpenCode 2.2.7) |
 | Node      | imports cleanly (`bun run smoke:node-import`) |
@@ -45,6 +46,10 @@ Version `2.3.1` rebuilds the headers of each model request from the Antigravity 
 profile, so headers added by OpenCode or its SDK no longer reach Google, and only reports a
 client version that is a plain `x.y.z`.
 
+Version `3.0.0` supports Windows 11 only. The default data folders of macOS and Linux are
+gone, hence the major number; nothing changes on Windows. The commands below are written
+for PowerShell.
+
 Version `2.4.0` removes the automatic checks. The plugin no longer asks GitHub whether
 CLIProxyAPI changed, and no longer reads the client version from Google's updater manifest:
 it reports the version set in the code (`2.29.0`) unless you set
@@ -62,8 +67,8 @@ unusable expiry are refused.
 
 ## Install
 
-```bash
-opencode plugin add github:LeProta/opencode-gemini-auth#v2.4.0
+```powershell
+opencode plugin add github:LeProta/opencode-gemini-auth#v3.0.0
 ```
 
 Pin a tag: `github:LeProta/opencode-gemini-auth` alone follows `main`. To update, change
@@ -73,7 +78,7 @@ the tag (or run `opencode plugin update`); to roll back, install the previous ta
 
 ## Sign in
 
-```bash
+```powershell
 opencode auth login google --method antigravity
 ```
 
@@ -123,8 +128,13 @@ With an API key connected instead, the plugin leaves the Google provider alone.
 | `OPENCODE_GEMINI_DEBUG=1` | Logs each request's URL, status, timing, trace id, masked headers, the model mapping and the final `generationConfig` to the plugin's log directory. No prompt, answer or tool result. |
 | `OPENCODE_GEMINI_DEBUG_CONTENT=1` | With `OPENCODE_GEMINI_DEBUG=1`: also logs request and response body previews and a 4 KB raw response excerpt. These contain your prompts and answers (tokens stay redacted): turn it on only to diagnose a problem. |
 
-The log directory and its files are created for your user only (`0700` / `0600`) on
-Linux and macOS; on Windows they inherit the permissions of the OpenCode data directory.
+Set a variable for the current PowerShell session before starting OpenCode, for example
+`$env:OPENCODE_GEMINI_DEBUG = "1"`.
+
+Logs go to `%LOCALAPPDATA%\opencode\gemini-auth\logs` (under `OPENCODE_DATA_DIR` or
+`XDG_DATA_HOME` when one is set). The plugin sets no access rights of its own: the files
+have the rights of that folder, so anyone who can read the folder can read them. Keep
+content logging off unless you need it, and delete the logs afterwards.
 
 ## How it works
 
@@ -155,7 +165,7 @@ The wire format lives in `src/wire.ts`, mirrored from
 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI); the last reviewed commit of
 each mirrored file is in `src/upstream.ts`. This command asks GitHub what changed since:
 
-```bash
+```powershell
 bun run check:cliproxy               # unreviewed commits, with diff links
 bun run check:cliproxy -- --accept   # after porting them into src/wire.ts and testing
 ```
@@ -170,7 +180,7 @@ updater manifest, `VERSION.manifestUrl` in `src/vendor/protocol.js`.
 
 ## Development
 
-```bash
+```powershell
 bun install
 bun run check     # tsc + Biome lint + bun test
 bun run bundle    # rebuild dist/ (commit it)
@@ -183,11 +193,11 @@ plugin cache.
 
 ## Publishing
 
-Bump `version` in `package.json`, `bun run check && bun run bundle`, commit `dist/`, tag
-`vX.Y.Z` and push `main` and the tag. The plugin is installed from the GitHub tag; it is
+Bump `version` in `package.json`, run `bun run check` then `bun run bundle`, commit `dist/`,
+tag `vX.Y.Z` and push `main` and the tag. The plugin is installed from the GitHub tag; it is
 not published to npm (the `opencode-gemini-auth` package there belongs to the upstream
-project). CI (`.github/workflows/ci.yml`) runs the checks and fails when `dist/` does not
-match the sources.
+project). CI (`.github/workflows/ci.yml`) runs the checks on a Windows Server 2025 runner
+(GitHub has no x64 Windows 11 runner) and fails when `dist/` does not match the sources.
 
 Credits: request handling started from
 [opencode-gemini-auth](https://github.com/jenslys/opencode-gemini-auth); stable
