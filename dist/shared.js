@@ -218,7 +218,7 @@ import { join as join2 } from "path";
 // src/storage-paths.ts
 import { homedir } from "os";
 import { join } from "path";
-function getOpencodeDataDir(env2 = process.env, platform = process.platform, homeDir = homedir()) {
+function getOpencodeDataDir(env2 = process.env, homeDir = homedir()) {
   const explicit = env2.OPENCODE_DATA_DIR?.trim();
   if (explicit) {
     return explicit;
@@ -227,20 +227,11 @@ function getOpencodeDataDir(env2 = process.env, platform = process.platform, hom
   if (xdgDataHome) {
     return join(xdgDataHome, "opencode");
   }
-  if (platform === "win32") {
-    const localAppData = env2.LOCALAPPDATA?.trim() || env2.APPDATA?.trim();
-    if (localAppData) {
-      return join(localAppData, "opencode");
-    }
-    return join(homeDir, "AppData", "Local", "opencode");
-  }
-  if (platform === "darwin") {
-    return join(homeDir, "Library", "Application Support", "opencode");
-  }
-  return join(homeDir, ".local", "share", "opencode");
+  const localAppData = env2.LOCALAPPDATA?.trim() || env2.APPDATA?.trim();
+  return join(localAppData || join(homeDir, "AppData", "Local"), "opencode");
 }
-function getGeminiPluginDataDir(env2 = process.env, platform = process.platform, homeDir = homedir()) {
-  return join(getOpencodeDataDir(env2, platform, homeDir), "gemini-auth");
+function getGeminiPluginDataDir(env2 = process.env, homeDir = homedir()) {
+  return join(getOpencodeDataDir(env2, homeDir), "gemini-auth");
 }
 
 // src/cache.ts
