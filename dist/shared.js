@@ -454,19 +454,27 @@ async function loadVersion() {
   const cache = await readCache();
   const cacheAge = now - (cache.versionFetchedAt ?? 0);
   if (cache.version && cacheAge < VERSION_TTL_MS) return cache.version;
+  const live = fetchLiveVersion(now);
+  if (cache.version && cacheAge < VERSION_TTL_MS * 4) {
+    void live.then((version) => {
+      if (version) versionMemo = void 0;
+    });
+    return cache.version;
+  }
+  return await live ?? FALLBACK_VERSION;
+}
+async function fetchLiveVersion(now) {
   try {
     const res = await geminiFetch(VERSION.manifestUrl, {
       headers: { "User-Agent": "electron-builder", "Cache-Control": "no-cache" },
       signal: AbortSignal.timeout(1e4)
     });
     const version = res.status === 200 ? parseVersionManifest(await readResponseText(res, 64 * 1024, "Antigravity version manifest")) : null;
-    if (version) {
-      await writeCache({ version, versionFetchedAt: now });
-      return version;
-    }
+    if (version) await writeCache({ version, versionFetchedAt: now });
+    return version ?? null;
   } catch {
+    return null;
   }
-  return cache.version && cacheAge < VERSION_TTL_MS * 4 ? cache.version : FALLBACK_VERSION;
 }
 
 // src/models.ts
