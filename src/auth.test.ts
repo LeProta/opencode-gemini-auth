@@ -60,7 +60,7 @@ describe("Google sign-in PKCE (RFC 7636)", () => {
     const calls = tokenEndpoint(200, '{"access_token":"a","expires_in":3600,"refresh_token":"r"}');
     const result = await exchangeCode("auth-code", "verifier-123");
     expect(result.type).toBe("success");
-    const form = new URLSearchParams(String(calls[0]!.body));
+    const form = new URLSearchParams(String(calls[0]?.body));
     expect(form.get("code_verifier")).toBe("verifier-123");
     expect(form.get("code")).toBe("auth-code");
     expect(form.get("grant_type")).toBe("authorization_code");
