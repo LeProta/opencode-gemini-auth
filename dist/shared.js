@@ -2,7 +2,7 @@
 import { Integration, Plugin } from "@opencode/plugin";
 
 // src/auth.ts
-import { randomBytes as randomBytes2 } from "crypto";
+import { createHash as createHash3, randomBytes as randomBytes2 } from "crypto";
 
 // src/bounded.ts
 var BodyLimitError = class extends Error {
@@ -1486,13 +1486,18 @@ function accessTokenExpired(auth) {
 }
 
 // src/auth.ts
+async function antigravityAuthorization() {
+  const state = randomBytes2(32).toString("hex");
+  const verifier = randomBytes2(32).toString("base64url");
+  const url = new URL(buildAuthUrl(state));
+  url.searchParams.set("code_challenge", createHash3("sha256").update(verifier).digest("base64url"));
+  url.searchParams.set("code_challenge_method", "S256");
+  return { url: url.toString(), verifier, state };
+}
 var authorizeAntigravity = createOAuthAuthorizeMethod({
   redirectUri: callbackUrl(),
-  authorizeFn: async () => {
-    const state = randomBytes2(32).toString("hex");
-    return { url: buildAuthUrl(state), verifier: "", state };
-  },
-  exchangeFn: (code) => exchangeCode(code),
+  authorizeFn: antigravityAuthorization,
+  exchangeFn: (code, verifier) => exchangeCode(code, verifier),
   resolveProjectContextFn: async (auth, accessToken) => {
     const projectId = await resolveProject(accessToken);
     void refreshModels(accessToken, projectId);
@@ -1536,10 +1541,12 @@ async function postTokenForm(form) {
   });
   return { status: res.status, text: await readResponseText(res, MAX_TOKEN_RESPONSE_BYTES, "Google token response") };
 }
-async function exchangeCode(code) {
+async function exchangeCode(code, verifier) {
   try {
     const ua = userAgents(await currentVersion());
-    const res = await postTokenForm(tokenExchangeForm(code));
+    const form = tokenExchangeForm(code);
+    if (verifier) form.set("code_verifier", verifier);
+    const res = await postTokenForm(form);
     if (res.status < 200 || res.status >= 300) {
       return { type: "failed", error: `Google rejected the authorization code (${res.status} ${oauthErrorCode(res.text)})` };
     }

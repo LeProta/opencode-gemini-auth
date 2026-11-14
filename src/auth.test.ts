@@ -1,6 +1,8 @@
+import { createHash } from "node:crypto";
+
 import { afterEach, describe, expect, it } from "bun:test";
 
-import { parseTokenResponse, refreshAuth } from "./auth";
+import { antigravityAuthorization, exchangeCode, parseTokenResponse, refreshAuth } from "./auth";
 
 const realFetch = globalThis.fetch;
 afterEach(() => {
@@ -36,6 +38,32 @@ describe("parseTokenResponse", () => {
     expect(parseTokenResponse('{"access_token":"a","expires_in":"3600"}')).toBeUndefined();
     expect(parseTokenResponse('{"access_token":"a","refresh_token":42}')).toBeUndefined();
     expect(parseTokenResponse("<html>")).toBeUndefined();
+  });
+});
+
+describe("Google sign-in PKCE (RFC 7636)", () => {
+  it("binds the authorization code to a per-sign-in S256 challenge", async () => {
+    const first = await antigravityAuthorization();
+    const second = await antigravityAuthorization();
+    const url = new URL(first.url);
+    expect(first.verifier).toMatch(/^[A-Za-z0-9\-._~]{43,128}$/);
+    expect(url.searchParams.get("code_challenge_method")).toBe("S256");
+    expect(url.searchParams.get("code_challenge")).toBe(createHash("sha256").update(first.verifier).digest("base64url"));
+    expect(second.verifier).not.toBe(first.verifier);
+    // What the Antigravity client registered is untouched.
+    expect(url.searchParams.get("state")).toBe(first.state);
+    expect(url.searchParams.get("redirect_uri")).toBe("http://localhost:51121/oauth-callback");
+    expect(url.origin + url.pathname).toBe("https://accounts.google.com/o/oauth2/v2/auth");
+  });
+
+  it("sends the verifier with the code exchange", async () => {
+    const calls = tokenEndpoint(200, '{"access_token":"a","expires_in":3600,"refresh_token":"r"}');
+    const result = await exchangeCode("auth-code", "verifier-123");
+    expect(result.type).toBe("success");
+    const form = new URLSearchParams(String(calls[0]!.body));
+    expect(form.get("code_verifier")).toBe("verifier-123");
+    expect(form.get("code")).toBe("auth-code");
+    expect(form.get("grant_type")).toBe("authorization_code");
   });
 });
 

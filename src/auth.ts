@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 
 import { readResponseText } from "./bounded";
 import { currentVersion } from "./config";
@@ -12,16 +12,28 @@ import { OAUTH, buildAuthUrl, callbackUrl, tokenExchangeForm, tokenRefreshForm }
 import { userAgents } from "./wire";
 
 /**
+ * Authorization URL of one sign-in. The redirect goes to a fixed `localhost` port and the
+ * client secret is public, so the code is bound to this sign-in with PKCE (RFC 7636, S256):
+ * Google documents it for desktop apps ("Always use PKCE"), and a code read by another local
+ * process is then useless without the verifier.
+ */
+export async function antigravityAuthorization(): Promise<{ url: string; verifier: string; state: string }> {
+  const state = randomBytes(32).toString("hex");
+  const verifier = randomBytes(32).toString("base64url");
+  const url = new URL(buildAuthUrl(state));
+  url.searchParams.set("code_challenge", createHash("sha256").update(verifier).digest("base64url"));
+  url.searchParams.set("code_challenge_method", "S256");
+  return { url: url.toString(), verifier, state };
+}
+
+/**
  * Google sign-in with the Antigravity OAuth client (callback on localhost:51121),
  * then Code Assist registration so the project id travels with the refresh token.
  */
 export const authorizeAntigravity = createOAuthAuthorizeMethod({
   redirectUri: callbackUrl(),
-  authorizeFn: async () => {
-    const state = randomBytes(32).toString("hex");
-    return { url: buildAuthUrl(state), verifier: "", state };
-  },
-  exchangeFn: (code) => exchangeCode(code),
+  authorizeFn: antigravityAuthorization,
+  exchangeFn: (code, verifier) => exchangeCode(code, verifier),
   resolveProjectContextFn: async (auth, accessToken) => {
     const projectId = await resolveProject(accessToken);
     void refreshModels(accessToken, projectId);
@@ -80,11 +92,13 @@ async function postTokenForm(form: URLSearchParams): Promise<{ status: number; t
   return { status: res.status, text: await readResponseText(res, MAX_TOKEN_RESPONSE_BYTES, "Google token response") };
 }
 
-/** Matches `exchangeGeminiWithVerifier`'s shape; Antigravity's client uses no PKCE. */
-export async function exchangeCode(code: string): Promise<TokenExchangeResult> {
+/** Exchanges the code with the PKCE verifier of the sign-in that produced it. */
+export async function exchangeCode(code: string, verifier: string): Promise<TokenExchangeResult> {
   try {
     const ua = userAgents(await currentVersion());
-    const res = await postTokenForm(tokenExchangeForm(code));
+    const form = tokenExchangeForm(code);
+    if (verifier) form.set("code_verifier", verifier);
+    const res = await postTokenForm(form);
     if (res.status < 200 || res.status >= 300) {
       return { type: "failed", error: `Google rejected the authorization code (${res.status} ${oauthErrorCode(res.text)})` };
     }
