@@ -1,6 +1,6 @@
 {
   "name": "opencode-gemini-auth",
-  "version": "2.3.1",
+  "version": "2.4.0",
   "author": "jenslys",
   "repository": "https://github.com/LeProta/opencode-gemini-auth",
   "main": "./dist/index.js",

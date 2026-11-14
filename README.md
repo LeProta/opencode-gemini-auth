@@ -43,22 +43,27 @@ keep working.
 
 Version `2.3.1` rebuilds the headers of each model request from the Antigravity client
 profile, so headers added by OpenCode or its SDK no longer reach Google, and only reports a
-client version that is a plain `x.y.z`, whether it comes from the override, the cache or
-Google's manifest.
+client version that is a plain `x.y.z`.
+
+Version `2.4.0` removes the automatic checks. The plugin no longer asks GitHub whether
+CLIProxyAPI changed, and no longer reads the client version from Google's updater manifest:
+it reports the version set in the code (`2.29.0`) unless you set
+`OPENCODE_ANTIGRAVITY_VERSION`. `OPENCODE_ANTIGRAVITY_UPDATE_CHECK` is gone. Changes are
+followed by hand (see [Keeping up with Google](#keeping-up-with-google)).
 
 Since `2.1.2` it also fixes: classifying a 429/5xx answer over 1 MB could hold the response forever;
 reasoning was turned off when the request asked for it without a level or budget; two cache writes
-made together lost one; a response arriving after a plugin reload stayed wrapped; the
-first request of the day waited for Google's version manifest. The sign-in now uses PKCE.
+made together lost one; a response arriving after a plugin reload stayed wrapped.
+The sign-in now uses PKCE.
 A refresh token Google refuses with `invalid_grant` (expired or revoked) is not sent
 again until OpenCode restarts or you sign in again; network errors and other answers
 are still retried. Token answers that are not tokens (RFC 6749 Appendix A) or carry an
-unusable expiry are refused, and a token refresh no longer waits for the version manifest.
+unusable expiry are refused.
 
 ## Install
 
 ```bash
-opencode plugin add github:LeProta/opencode-gemini-auth#v2.3.1
+opencode plugin add github:LeProta/opencode-gemini-auth#v2.4.0
 ```
 
 Pin a tag: `github:LeProta/opencode-gemini-auth` alone follows `main`. To update, change
@@ -112,8 +117,7 @@ With an API key connected instead, the plugin leaves the Google provider alone.
 
 | Variable | Effect |
 |----------|--------|
-| `OPENCODE_ANTIGRAVITY_VERSION` | Forces the Antigravity client version reported upstream (`x.y.z`). A malformed value is ignored with an error line. Default: read live from Google's updater manifest (cached 6 h), then a bundled fallback. |
-| `OPENCODE_ANTIGRAVITY_UPDATE_CHECK=0` | Turns off the daily CLIProxyAPI change check. |
+| `OPENCODE_ANTIGRAVITY_VERSION` | Sets the Antigravity client version reported upstream (`x.y.z`). A malformed value is ignored with an error line. Default: `2.29.0`, set in `src/wire.ts`. |
 | `OPENCODE_GEMINI_MAX_RETRY_MS` | Longest server-requested retry delay to wait for. |
 | `OPENCODE_GEMINI_AUTH_PROXY` | HTTP proxy for the plugin's own requests. |
 | `OPENCODE_GEMINI_DEBUG=1` | Logs each request's URL, status, timing, trace id, masked headers, the model mapping and the final `generationConfig` to the plugin's log directory. No prompt, answer or tool result. |
@@ -144,16 +148,25 @@ before they reach OpenCode's credential store.
 
 ### Keeping up with Google
 
-The client version is read live from Google's updater manifest. The rest of the wire
-format lives in `src/wire.ts`, mirrored from
+Nothing is checked automatically: the plugin contacts Google only for your account (sign-in,
+token, model catalog, quota, model requests). You follow the changes by hand.
+
+The wire format lives in `src/wire.ts`, mirrored from
 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI); the last reviewed commit of
-each mirrored file is in `src/upstream.ts`. At startup (at most once a day) the plugin
-checks GitHub and warns when one of them changed. It never downloads or runs code.
+each mirrored file is in `src/upstream.ts`. This command asks GitHub what changed since:
 
 ```bash
 bun run check:cliproxy               # unreviewed commits, with diff links
 bun run check:cliproxy -- --accept   # after porting them into src/wire.ts and testing
 ```
+
+The reported client version is `DEFAULT_VERSION` in `src/wire.ts` (`2.29.0`): the version
+of the mirrored profile, and the newest release whose changelist (`cl=`) is recorded, so the
+User-Agent is complete. It is not the latest release Google publishes. If Google starts
+refusing a model for this version, set `OPENCODE_ANTIGRAVITY_VERSION` to a newer one (the
+User-Agent is then sent without `cl=`), or update `DEFAULT_VERSION` and `HUB_CHANGELISTS`
+together when `check:cliproxy` shows a newer profile. The version Google ships is in its
+updater manifest, `VERSION.manifestUrl` in `src/vendor/protocol.js`.
 
 ## Development
 
