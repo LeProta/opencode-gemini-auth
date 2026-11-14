@@ -4,12 +4,18 @@
  *   internal/misc/antigravity_version.go                     (version, User-Agents)
  *   internal/auth/antigravity/auth.go + constants.go          (registration)
  *   internal/runtime/executor/antigravity_executor_request.go (envelope)
- * When the update check reports a change in one of those files, port it here.
+ * When `bun run check:cliproxy` reports a change in one of those files, port it here.
  */
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 
-/** Cloud Code rejects newer models for clients below 2.23.0. */
-export const FALLBACK_VERSION = "2.29.0";
+/**
+ * Client version reported unless OPENCODE_ANTIGRAVITY_VERSION is set. It is the version of the
+ * mirrored CLIProxyAPI profile (its fallback at the reviewed commit) and the newest release whose
+ * changelist is recorded below, so the User-Agent is complete. Cloud Code rejects newer models
+ * for clients below 2.23.0. Change it by hand, together with HUB_CHANGELISTS, when porting a
+ * newer profile: it is not read from Google's updater manifest any more.
+ */
+export const DEFAULT_VERSION = "2.29.0";
 const HUB_PLATFORM = "os_type=darwin; arch=arm64";
 export const NODE_API_CLIENT_UA = "google-api-nodejs-client/10.3.0";
 export const GOOG_API_CLIENT = "gl-node/22.21.1";

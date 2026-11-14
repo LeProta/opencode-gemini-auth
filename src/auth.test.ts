@@ -3,7 +3,6 @@ import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it } from "bun:test";
 
 import { antigravityAuthorization, authorizeAntigravity, exchangeCode, parseTokenResponse, refreshAuth } from "./auth";
-import { resetVersionForTests } from "./config";
 
 const hosted = "https://antigravity.google/oauth-callback";
 const realFetch = globalThis.fetch;
@@ -162,15 +161,14 @@ describe("refreshAuth", () => {
     expect((await refreshAuth({ ...auth, refresh: "rt-after-sign-in" }, async () => {})).access).toBe("fresh");
   });
 
-  it("does not wait for the version manifest: the token request is the same for every version", async () => {
-    resetVersionForTests();
+  it("waits for nothing else: the token request is the same for every version", async () => {
     const tokenUserAgents: (string | null)[] = [];
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       if (String(input).includes("oauth2.googleapis.com/token")) {
         tokenUserAgents.push(new Headers(init?.headers).get("user-agent"));
         return new Response('{"access_token":"quick","expires_in":3600}');
       }
-      return new Promise<Response>(() => {}); // the manifest never answers
+      return new Promise<Response>(() => {}); // any other request never answers
     }) as typeof fetch;
     const next = await refreshAuth({ ...auth, refresh: "rt-no-manifest" }, async () => {});
     expect(next.access).toBe("quick");

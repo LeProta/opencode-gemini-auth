@@ -17,7 +17,6 @@ import { refreshModels, requestedThinkingLevel, upstreamModelFor } from "./model
 import { resolveProject } from "./project";
 import { fetchQuotaSummary, formatQuotaSummary } from "./quota";
 import { toAntigravityRequest } from "./transform";
-import { checkUpstreamUpdate } from "./upstream";
 import { readBoundedText, readPrefix } from "./bounded";
 import { geminiFetch } from "./fetch";
 import { accessTokenExpired, parseRefreshParts } from "./refresh-parts";
@@ -188,7 +187,6 @@ async function quotaReport(ctx: V2Context): Promise<{ ok: boolean; text: string 
 
 export async function setup(ctx: V2Context): Promise<Plugin.Cleanup> {
   if (ctx.storage) useCacheStorage(ctx.storage);
-  void checkUpstreamUpdate((message) => console.warn(`[leprota.google-auth] ${message}`));
 
   const recentFailures = new Map<string, RecentFailure>();
   const eventAbort = new AbortController();
@@ -316,7 +314,7 @@ export async function setup(ctx: V2Context): Promise<Plugin.Cleanup> {
         auth.access,
         projectId,
       );
-      const target = toAntigravityRequest(String(prepared.request), prepared.init, projectId, await currentVersion());
+      const target = toAntigravityRequest(String(prepared.request), prepared.init, projectId, currentVersion());
 
       // Wait out a cooldown recorded by an earlier 429 on the same project/model.
       const throttleKey = buildRetryThrottleKey(target.url, target.init);

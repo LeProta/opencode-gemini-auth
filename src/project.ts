@@ -24,7 +24,7 @@ function extractProject(data: unknown): string {
 }
 
 export async function resolveProject(accessToken: string): Promise<string> {
-  const version = await currentVersion();
+  const version = currentVersion();
   const ua = userAgents(version);
   const load = await upstreamJson(`${API.dailyBase}${API.loadCodeAssistPath}`, {
     token: accessToken,

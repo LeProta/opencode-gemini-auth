@@ -53,7 +53,7 @@ export function isPublishableModelId(id: string): boolean {
 
 /** Refreshes the cached catalog. Returns the publishable ids, or undefined when upstream gave none. */
 export async function refreshModels(accessToken: string, project: string): Promise<string[] | undefined> {
-  const ua = userAgents(await currentVersion());
+  const ua = userAgents(currentVersion());
   for (const base of [API.prodBase, API.dailyBase]) {
     try {
       const res = await upstreamJson(`${base}${API.fetchModelsPath}`, {

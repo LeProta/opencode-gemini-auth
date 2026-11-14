@@ -6,7 +6,7 @@ import { userAgents } from "./wire";
 
 /** Subscription quota pools (weekly / 5-hour windows), as the bridge reads them. */
 export async function fetchQuotaSummary(accessToken: string, project: string): Promise<QuotaSummary | null> {
-  const ua = userAgents(await currentVersion());
+  const ua = userAgents(currentVersion());
   for (const base of [API.dailyBase, API.prodBase]) {
     try {
       const res = await upstreamJson(`${base}${API.quotaSummaryPath}`, {

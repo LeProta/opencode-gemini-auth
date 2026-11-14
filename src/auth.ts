@@ -118,7 +118,7 @@ export async function exchangeCode(code: string, verifier: string): Promise<Toke
     if (!tokens.refresh) return { type: "failed", error: "Missing refresh token in response" };
     let email: string | undefined;
     try {
-      const ua = userAgents(await currentVersion()).short;
+      const ua = userAgents(currentVersion()).short;
       const info = await upstreamJson(OAUTH.userinfoEndpoint, { method: "GET", token: tokens.access, ua });
       if (typeof info.json?.email === "string") email = info.json.email;
     } catch {}

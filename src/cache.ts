@@ -1,4 +1,4 @@
-/** Non-secret plugin cache (client version, model catalogs, update check), in OpenCode's plugin storage. */
+/** Non-secret plugin cache (model catalogs), in OpenCode's plugin storage. */
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -11,15 +11,11 @@ export interface ModelCaps {
 }
 
 export interface AntigravityCache {
-  version?: string;
-  versionFetchedAt?: number;
   /** Last catalog fetched (pre-2.1 caches only have this). */
   models?: string[];
   /** Catalog of each account, by Cloud Code project. */
   modelsByProject?: Record<string, string[]>;
   modelCaps?: Record<string, ModelCaps>;
-  updateCheckedAt?: number;
-  upstreamShas?: Record<string, string>;
 }
 
 const cachePath = () => join(getGeminiPluginDataDir(), "antigravity.json");

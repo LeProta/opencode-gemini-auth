@@ -2,11 +2,9 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 
 import { setup } from ".";
 
-process.env.OPENCODE_ANTIGRAVITY_UPDATE_CHECK = "0";
-
 const realFetch = globalThis.fetch;
 beforeAll(() => {
-  // No network in tests: catalog/version refreshes fail and fall back to the cache.
+  // No network in tests: catalog refreshes fail and fall back to the cache.
   globalThis.fetch = (async () => new Response("offline", { status: 503 })) as unknown as typeof fetch;
 });
 afterAll(() => {
@@ -28,8 +26,6 @@ function fakeContext(credential: unknown) {
     [
       "antigravity-cache",
       {
-        version: "2.31.2",
-        versionFetchedAt: Date.now(),
         models: ["gemini-2.5-pro", "gemini-3-flash", "gemini-3.8-flash-low", "gemini-3.8-flash-high"],
         // Two accounts on different plans (the cache module keeps the first storage it is given).
         modelsByProject: { "proj-ultra": ["gemini-2.5-pro", "gemini-3-flash"], "proj-pro": ["gemini-3-flash"] },
@@ -127,6 +123,33 @@ describe("Google OAuth on the built-in provider", () => {
     const envelope = await event.request.json();
     expect(envelope).toMatchObject({ model: "gemini-3.8-flash-low", project: "proj-1", requestType: "agent" });
     expect(envelope.request.generationConfig.thinkingConfig).toEqual({ includeThoughts: true, thinkingLevel: "low" });
+  });
+
+  it("contacts no update source at setup or on a model request", async () => {
+    const offline = globalThis.fetch;
+    const hosts: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      hosts.push(new URL(input instanceof Request ? input.url : String(input)).host);
+      return new Response("offline", { status: 503 });
+    }) as unknown as typeof fetch;
+    try {
+      const { ctx, hooks } = fakeContext(subscription);
+      await setup(ctx);
+      const event = {
+        model: { id: "gemini-3-flash" },
+        request: new Request("https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash:generateContent", {
+          method: "POST",
+          body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "hi" }] }] }),
+        }),
+      };
+      await hooks.get("http.request")?.(event);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      // Only the account's own Cloud Code calls (model catalog): no GitHub, no version manifest.
+      expect(hosts.filter((host) => !host.endsWith("cloudcode-pa.googleapis.com"))).toEqual([]);
+      expect(event.request.headers.get("user-agent")).toContain("antigravity/hub/2.29.0 ");
+    } finally {
+      globalThis.fetch = offline;
+    }
   });
 
   it("keeps using the token refreshed after a 401 on the next request", async () => {
