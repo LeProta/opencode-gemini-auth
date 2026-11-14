@@ -36,12 +36,17 @@ the minor for compatible features, and the patch for fixes or documentation upda
 Each plugin advances independently; matching numbers do not imply matching features.
 Fork versions are independent of upstream versions and client versions sent to APIs.
 
-Version `2.3.0` changes the sign-in: Google's page shows a code that you paste into
+Version `2.3.0` changed the sign-in: Google's page shows a code that you paste into
 OpenCode, on a desktop as over SSH, as with the Claude login. The plugin no longer listens
 on `localhost:51121` and no longer opens the browser itself. Connections already stored
 keep working.
 
-It also fixes: classifying a 429/5xx answer over 1 MB could hold the response forever;
+Version `2.3.1` rebuilds the headers of each model request from the Antigravity client
+profile, so headers added by OpenCode or its SDK no longer reach Google, and only reports a
+client version that is a plain `x.y.z`, whether it comes from the override, the cache or
+Google's manifest.
+
+Since `2.1.2` it also fixes: classifying a 429/5xx answer over 1 MB could hold the response forever;
 reasoning was turned off when the request asked for it without a level or budget; two cache writes
 made together lost one; a response arriving after a plugin reload stayed wrapped; the
 first request of the day waited for Google's version manifest. The sign-in now uses PKCE.
@@ -53,7 +58,7 @@ unusable expiry are refused, and a token refresh no longer waits for the version
 ## Install
 
 ```bash
-opencode plugin add github:LeProta/opencode-gemini-auth#v2.3.0
+opencode plugin add github:LeProta/opencode-gemini-auth#v2.3.1
 ```
 
 Pin a tag: `github:LeProta/opencode-gemini-auth` alone follows `main`. To update, change
@@ -125,7 +130,10 @@ integration and three session hooks on the Google provider:
 1. **http.request** — maps the model id on the account's catalog, rewrites the Gemini
    API call into an Antigravity envelope (`src/transform.ts`, `src/wire.ts`), and sends
    it to `daily-cloudcode-pa.googleapis.com` only (any other origin is refused,
-   redirects too).
+   redirects too). The envelope and the headers are built by the plugin: nothing the
+   caller put there is forwarded. Thought signatures returned by Google are opaque and go
+   back unchanged; Google has no request signature to compute (nothing like Claude Code's
+   `cch`).
 2. **http.response** — 401 replay, quota classification, then unwraps the envelope back
    into Gemini API responses; SSE is transformed at the consumer's pace with bounded
    buffers.
