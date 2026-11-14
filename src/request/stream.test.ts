@@ -36,6 +36,18 @@ describe("streaming SSE transform", () => {
     );
   });
 
+  it("hands Google's thought signatures to OpenCode unchanged, even split across chunks", async () => {
+    const signature = "CpQCAdHtim9+/ZzA\\u003d\\u003d"; // "=" escaped the way Google's JSON does
+    const parts = `[{"functionCall":{"name":"bash","args":{}},"thoughtSignature":"${signature}"},{"text":"","thoughtSignature":"${signature}"}]`;
+    const sse = `data: {"response":{"candidates":[{"content":{"role":"model","parts":${parts}}}]},"traceId":"t1"}\n\n`;
+    const cut = sse.indexOf("Htim9");
+    const { stream } = countingSource([sse.slice(0, cut), sse.slice(cut)]);
+    const text = await new Response(transformStreamingPayloadStream(stream)).text();
+    const received = JSON.parse(text.slice("data: ".length).trim()).candidates[0].content.parts;
+    expect(received).toEqual(JSON.parse(parts));
+    expect(received[0].thoughtSignature).toBe("CpQCAdHtim9+/ZzA==");
+  });
+
   it("does not drain the upstream while nobody reads the output", async () => {
     const { stream, state } = countingSource(Array.from({ length: 100 }, (_, i) => event(String(i))));
     transformStreamingPayloadStream(stream);

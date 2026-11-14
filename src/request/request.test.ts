@@ -298,6 +298,57 @@ describe("request helpers", () => {
     expect(req.extra_body).toBeUndefined();
   });
 
+  it("returns Google's thought signatures unchanged, on the part that carried them", () => {
+    // Opaque values: base64 characters, and one that contains the documented dummy value.
+    const first = "CpQCAdHtim9+/ZzA==";
+    const last = "EoYBCoMBAb4+9vt/skip_thought_signature_validator==";
+    const result = prepareGeminiRequest(
+      "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          contents: [
+            { role: "user", parts: [{ text: "run both" }] },
+            {
+              role: "model",
+              parts: [
+                { functionCall: { name: "bash", args: {} }, thoughtSignature: first },
+                { functionCall: { name: "read", args: {} } },
+              ],
+            },
+            {
+              role: "user",
+              parts: [
+                { functionResponse: { name: "bash", response: {} } },
+                { functionResponse: { name: "read", response: {} } },
+              ],
+            },
+            // A step the API did not sign gets the dummy value Google documents, and only that step.
+            { role: "model", parts: [{ functionCall: { name: "bash", args: {} } }] },
+            { role: "user", parts: [{ functionResponse: { name: "bash", response: {} } }] },
+            { role: "model", parts: [{ text: "done" }, { text: "", thoughtSignature: last }] },
+            { role: "user", parts: [{ text: "thanks" }] },
+          ],
+        }),
+      },
+      "tok",
+      "proj",
+    );
+    const contents = (JSON.parse(result.init.body as string).request as {
+      contents: Array<{ parts: Array<Record<string, unknown>> }>;
+    }).contents;
+    const signatures = contents.map((content) => content.parts.map((part) => part.thoughtSignature ?? null));
+    expect(signatures).toEqual([
+      [null],
+      [first, null],
+      [null, null],
+      ["skip_thought_signature_validator"],
+      [null],
+      [null, last],
+      [null],
+    ]);
+  });
+
   it("rescues thoughtSignature when stripping thought parts and avoids overwriting with skip fallback", () => {
     const input =
       "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent";
