@@ -40,16 +40,33 @@ async function loadVersion(): Promise<string> {
   const cache = await readCache();
   const cacheAge = now - (cache.versionFetchedAt ?? 0);
   if (cache.version && cacheAge < VERSION_TTL_MS) return cache.version;
+  const live = fetchLiveVersion(now);
+  if (cache.version && cacheAge < VERSION_TTL_MS * 4) {
+    // Yesterday's version answers now; the manifest (up to 10 s when it is unreachable)
+    // is read behind it instead of holding the first request of the day.
+    void live.then((version) => {
+      if (version) versionMemo = undefined;
+    });
+    return cache.version;
+  }
+  return (await live) ?? FALLBACK_VERSION;
+}
+
+async function fetchLiveVersion(now: number): Promise<string | null> {
   try {
     const res = await geminiFetch(VERSION.manifestUrl, {
       headers: { "User-Agent": "electron-builder", "Cache-Control": "no-cache" },
       signal: AbortSignal.timeout(10_000),
     });
     const version = res.status === 200 ? parseVersionManifest(await readResponseText(res, 64 * 1024, "Antigravity version manifest")) : null;
-    if (version) {
-      await writeCache({ version, versionFetchedAt: now });
-      return version;
-    }
-  } catch {}
-  return cache.version && cacheAge < VERSION_TTL_MS * 4 ? cache.version : FALLBACK_VERSION;
+    if (version) await writeCache({ version, versionFetchedAt: now });
+    return version ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** Test hook: forget the memoized version. */
+export function resetVersionForTests(): void {
+  versionMemo = undefined;
 }
