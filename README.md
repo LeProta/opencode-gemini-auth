@@ -35,7 +35,8 @@ Fork versions are independent of upstream versions and client versions sent to A
 Version `2.1.3` fixes: classifying a 429/5xx answer over 1 MB could hold the response
 forever; a sign-in left unfinished kept the callback port for 5 minutes; reasoning was
 turned off when the request asked for it without a level or budget; two cache writes
-made together lost one; a response arriving after a plugin reload stayed wrapped.
+made together lost one; a response arriving after a plugin reload stayed wrapped; the
+first request of the day waited for Google's version manifest.
 
 ## Install
 
@@ -127,15 +128,17 @@ bun run bundle    # rebuild dist/ (commit it)
 ```
 
 Run them with the Bun that OpenCode embeds (see Version support): with Bun 1.3.14 on
-Windows `bun test` hangs in `auth.test.ts`. Tests use a temporary `OPENCODE_DATA_DIR`
-(`src/test-preload.ts`), never your real plugin cache.
+Windows `AbortSignal.timeout()` never fires in an idle `bun test` and `bounded.test.ts`
+hangs. Tests use a temporary `OPENCODE_DATA_DIR` (`src/test-preload.ts`), never your real
+plugin cache.
 
 ## Publishing
 
 Bump `version` in `package.json`, `bun run check && bun run bundle`, commit `dist/`, tag
-`vX.Y.Z`, then push the **tag first** and `main` second. The release workflow publishes
-to npm when `main` brings a new version whose tag does not exist yet (and fails without
-an `NPM_TOKEN` secret); with the tag already pushed it skips npm.
+`vX.Y.Z` and push `main` and the tag. The plugin is installed from the GitHub tag; it is
+not published to npm (the `opencode-gemini-auth` package there belongs to the upstream
+project). CI (`.github/workflows/ci.yml`) runs the checks and fails when `dist/` does not
+match the sources.
 
 Credits: request handling started from
 [opencode-gemini-auth](https://github.com/jenslys/opencode-gemini-auth); stable
