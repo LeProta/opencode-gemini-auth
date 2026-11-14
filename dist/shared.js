@@ -478,7 +478,6 @@ async function fetchLiveVersion(now) {
 
 // src/constants.ts
 var GEMINI_CODE_ASSIST_ENDPOINT = "https://cloudcode-pa.googleapis.com";
-var GEMINI_REDIRECT_URI = "http://localhost:51121/oauth-callback";
 var ANTIGRAVITY_CODE_REDIRECT_URI = "https://antigravity.google/oauth-callback";
 
 // src/models.ts
@@ -533,9 +532,6 @@ async function refreshModels(accessToken, project) {
   }
   return void 0;
 }
-
-// src/oauth/authorize.ts
-import { spawn } from "child_process";
 
 // src/debug.ts
 import { appendFileSync as appendFileSync2, mkdirSync as mkdirSync2 } from "fs";
@@ -804,348 +800,9 @@ function resolveDebugLogFilePath() {
   return cachedLogFilePath;
 }
 
-// src/oauth/server.ts
-import { createServer } from "http";
-var defaultRedirectUri = new URL(GEMINI_REDIRECT_URI);
-function escapeHtml(value) {
-  return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
-}
-function renderFailureResponse(message) {
-  const detail = escapeHtml(
-    message?.trim() || "Authentication could not be completed. Return to Opencode and try again."
-  );
-  return `<!DOCTYPE html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <title>OpenCode Google sign-in failed</title>
-    <style>
-      :root { color-scheme: light dark; }
-      body {
-        margin: 0;
-        min-height: 100vh;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        font-family: "Roboto", "Google Sans", arial, sans-serif;
-        background: #f1f3f4;
-        color: #202124;
-      }
-      main {
-        width: min(448px, calc(100% - 3rem));
-        background: #ffffff;
-        border-radius: 28px;
-        padding: 2.5rem 2.75rem;
-        box-shadow: 0 1px 2px rgba(60, 64, 67, 0.3), 0 2px 6px rgba(60, 64, 67, 0.15);
-      }
-      h1 { margin: 0 0 0.75rem; font-size: 1.5rem; font-weight: 500; color: #c5221f; }
-      p { margin: 0; font-size: 0.95rem; line-height: 1.5; color: #3c4043; word-break: break-word; }
-      @media (prefers-color-scheme: dark) {
-        body { background: #1f1f1f; color: #e8eaed; }
-        main { background: #2d2e30; box-shadow: 0 1px 3px rgba(0, 0, 0, 0.5); }
-        h1 { color: #f28b82; }
-        p { color: #bdc1c6; }
-      }
-    </style>
-  </head>
-  <body>
-    <main role="main">
-      <h1>Authentication failed</h1>
-      <p>${detail}</p>
-    </main>
-  </body>
-</html>`;
-}
-function createOAuthCallbackRequestHandler(deps) {
-  const successHtml = deps.successResponse ?? "<!DOCTYPE html><html><body>You're connected to OpenCode</body></html>";
-  return (request, response) => {
-    const finishResponse = (statusCode, headers, body, afterFlush) => {
-      response.writeHead(statusCode, { Connection: "close", ...headers });
-      response.end(body, () => {
-        afterFlush?.();
-      });
-    };
-    if (!request.url) {
-      finishResponse(400, { "Content-Type": "text/plain; charset=utf-8" }, "Invalid request");
-      return;
-    }
-    let url;
-    try {
-      url = new URL(request.url, deps.getOrigin());
-    } catch {
-      finishResponse(400, { "Content-Type": "text/plain; charset=utf-8" }, "Invalid request");
-      return;
-    }
-    if (url.pathname !== deps.callbackPath) {
-      finishResponse(404, { "Content-Type": "text/plain; charset=utf-8" }, "Not found");
-      return;
-    }
-    const hasCode = !!url.searchParams.get("code");
-    const hasState = !!url.searchParams.get("state");
-    const hasError = !!url.searchParams.get("error");
-    if (!hasState || !hasError && !hasCode) {
-      finishResponse(
-        400,
-        { "Content-Type": "text/plain; charset=utf-8" },
-        "Ignoring incomplete OAuth callback. Return to the Google sign-in flow."
-      );
-      return;
-    }
-    if (!deps.onCallback) {
-      finishResponse(200, { "Content-Type": "text/html; charset=utf-8" }, successHtml, () => {
-        deps.deliverCallback(url);
-      });
-      return;
-    }
-    void (async () => {
-      try {
-        const reply = await deps.onCallback(url);
-        const status = reply.status ?? (reply.ok ? 200 : 400);
-        const body = reply.html ?? (reply.ok ? successHtml : renderFailureResponse(reply.message));
-        const shouldDeliver = reply.terminal !== false;
-        finishResponse(status, { "Content-Type": "text/html; charset=utf-8" }, body, () => {
-          if (shouldDeliver) {
-            deps.deliverCallback(url);
-          }
-        });
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        finishResponse(
-          500,
-          { "Content-Type": "text/html; charset=utf-8" },
-          renderFailureResponse(message),
-          () => {
-            deps.failPendingWaiters(error instanceof Error ? error : new Error(message));
-          }
-        );
-      }
-    })();
-  };
-}
-async function startOAuthListener({ timeoutMs = 5 * 60 * 1e3, redirectUri: redirectUriOverride, onCallback } = {}) {
-  const parsedRedirectUri = redirectUriOverride ? new URL(redirectUriOverride) : defaultRedirectUri;
-  const callbackPath = parsedRedirectUri.pathname || "/";
-  const requestedPort = parsedRedirectUri.port ? Number.parseInt(parsedRedirectUri.port, 10) : parsedRedirectUri.protocol === "https:" ? 443 : 80;
-  let boundPort = requestedPort;
-  let origin = `${parsedRedirectUri.protocol}//${parsedRedirectUri.host}`;
-  const callbackQueue = [];
-  const callbackWaiters = [];
-  let terminalError;
-  const successResponse = `<!DOCTYPE html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <title>OpenCode Google sign-in</title>
-    <style>
-      :root { color-scheme: light dark; }
-      body {
-        margin: 0;
-        min-height: 100vh;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        font-family: "Roboto", "Google Sans", arial, sans-serif;
-        background: #f1f3f4;
-        color: #202124;
-      }
-      main {
-        width: min(448px, calc(100% - 3rem));
-        background: #ffffff;
-        border-radius: 28px;
-        padding: 2.5rem 2.75rem;
-        box-shadow: 0 1px 2px rgba(60, 64, 67, 0.3), 0 2px 6px rgba(60, 64, 67, 0.15);
-      }
-      header {
-        display: flex;
-        align-items: center;
-        gap: 0.75rem;
-        margin-bottom: 1.5rem;
-      }
-      .logo {
-        width: 40px;
-        height: 40px;
-        display: inline-flex;
-      }
-      .logo svg {
-        width: 100%;
-        height: 100%;
-      }
-      .brand {
-        font-size: 1.1rem;
-        font-weight: 500;
-        letter-spacing: 0.01em;
-      }
-      h1 {
-        margin: 0 0 0.75rem;
-        font-size: 1.75rem;
-        font-weight: 500;
-        letter-spacing: -0.01em;
-      }
-      p {
-        margin: 0 0 1.75rem;
-        font-size: 1.05rem;
-        line-height: 1.6;
-        color: #3c4043;
-      }
-      .note {
-        margin: 1.5rem 0 0;
-        font-size: 0.92rem;
-        color: #5f6368;
-      }
-      .action {
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        padding: 0.65rem 1.85rem;
-        border-radius: 999px;
-        background: #1a73e8;
-        color: #ffffff;
-        font-weight: 500;
-        font-size: 0.95rem;
-        letter-spacing: 0.02em;
-        text-decoration: none;
-        transition: box-shadow 0.2s ease, transform 0.2s ease;
-      }
-      .action:hover {
-        transform: translateY(-1px);
-        box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 1px 3px rgba(60, 64, 67, 0.15);
-      }
-      .action:focus-visible {
-        outline: none;
-        box-shadow: 0 0 0 3px rgba(26, 115, 232, 0.3);
-      }
-      @media (prefers-color-scheme: dark) {
-        body {
-          background: #131314;
-          color: #e8eaed;
-        }
-        main {
-          background: #202124;
-          box-shadow: 0 1px 2px rgba(0, 0, 0, 0.5), 0 2px 6px rgba(0, 0, 0, 0.4);
-        }
-        p {
-          color: #e8eaed;
-        }
-        .note {
-          color: #bdc1c6;
-        }
-        .action {
-          background: #8ab4f8;
-          color: #202124;
-        }
-      }
-    </style>
-  </head>
-  <body>
-    <main>
-      <header>
-        <span class="logo" aria-hidden="true">
-          <svg viewBox="0 0 46 46" xmlns="http://www.w3.org/2000/svg" role="img">
-            <title>Google linked to OpenCode</title>
-            <path fill="#4285F4" d="M43.6 23.5c0-1.5-.1-3-.4-4.4H23v8.3h11.6c-.5 2.8-2 5.1-4.2 6.7v5.5h6.8c4-3.7 6.4-9.1 6.4-16.1z"/>
-            <path fill="#34A853" d="M23 45c5.8 0 10.6-1.9 14.1-5.2l-6.8-5.5c-1.9 1.3-4.3 2-7.3 2-5.6 0-10.4-3.7-12.1-8.7H3.8v5.6C7.3 39.9 14.6 45 23 45z"/>
-            <path fill="#FBBC04" d="M10.9 28.6c-.5-1.3-.8-2.7-.8-4.1 0-1.5.3-2.8.8-4.1v-5.6H3.8C2.3 17.7 1.5 20.2 1.5 24s.8 6.3 2.3 9.2l6.9-5.6z"/>
-            <path fill="#EA4335" d="M23 9.5c3.2 0 6 .9 8.3 2.7l6.2-6.2C33.6 2.2 28.8 0 23 0 14.6 0 7.3 5.1 3.8 12.4l7.1 5.6c1.7-5 6.5-8.5 12.1-8.5z"/>
-          </svg>
-        </span>
-        <span class="brand">Google linked to OpenCode</span>
-      </header>
-      <h1>You're connected to OpenCode</h1>
-      <p>Your Google account is now linked to Opencode. You can close this window and continue in the CLI.</p>
-      <a class="action" href="javascript:window.close()">Close window</a>
-      <p class="note">Need to reconnect later? Re-run the authentication command in Opencode.</p>
-    </main>
-  </body>
-</html>`;
-  const deliverCallback = (url) => {
-    const waiter = callbackWaiters.shift();
-    if (waiter) {
-      waiter.resolve(url);
-      return;
-    }
-    callbackQueue.push(url);
-  };
-  const failPendingWaiters = (error) => {
-    if (terminalError) {
-      return;
-    }
-    terminalError = error;
-    while (callbackWaiters.length > 0) {
-      callbackWaiters.shift()?.reject(error);
-    }
-  };
-  const timeoutHandle = setTimeout(() => {
-    failPendingWaiters(new Error("Timed out waiting for OAuth callback"));
-  }, timeoutMs);
-  timeoutHandle.unref?.();
-  const server = createServer(
-    createOAuthCallbackRequestHandler({
-      getOrigin: () => origin,
-      callbackPath,
-      successResponse,
-      onCallback,
-      deliverCallback,
-      failPendingWaiters
-    })
-  );
-  await new Promise((resolve, reject) => {
-    const handleError = (error) => {
-      server.off("error", handleError);
-      reject(error);
-    };
-    server.once("error", handleError);
-    server.listen(requestedPort, "127.0.0.1", () => {
-      server.off("error", handleError);
-      const addr = server.address();
-      if (addr && typeof addr === "object") {
-        boundPort = addr.port;
-        const responseHost = parsedRedirectUri.hostname || "127.0.0.1";
-        origin = `${parsedRedirectUri.protocol}//${responseHost}:${boundPort}`;
-      }
-      resolve();
-    });
-  });
-  const resolvedRedirectUri = new URL(callbackPath, origin).toString();
-  server.on("error", (error) => {
-    failPendingWaiters(error instanceof Error ? error : new Error(String(error)));
-  });
-  return {
-    port: boundPort,
-    redirectUri: resolvedRedirectUri,
-    waitForCallback: async () => {
-      if (callbackQueue.length > 0) {
-        return callbackQueue.shift();
-      }
-      if (terminalError) {
-        throw terminalError;
-      }
-      return await new Promise((resolve, reject) => {
-        callbackWaiters.push({ resolve, reject });
-      });
-    },
-    close: () => new Promise((resolve, reject) => {
-      server.closeIdleConnections?.();
-      server.close((error) => {
-        if (error && error.code !== "ERR_SERVER_NOT_RUNNING") {
-          reject(error);
-          return;
-        }
-        if (timeoutHandle) {
-          clearTimeout(timeoutHandle);
-        }
-        failPendingWaiters(new Error("OAuth listener closed before callback"));
-        resolve();
-      });
-    })
-  };
-}
-
 // src/oauth/authorize.ts
 function createOAuthAuthorizeMethod(options) {
   const { authorizeFn, exchangeFn, resolveProjectContextFn } = options;
-  const startListenerFn = options.startListenerFn ?? startOAuthListener;
-  const openBrowser = options.openBrowser ?? openBrowserUrl;
-  let activeListener = null;
   return async () => {
     const maybeHydrateProjectId = async (result) => {
       if (result.type !== "success" || !result.access || !resolveProjectContextFn) {
@@ -1171,165 +828,13 @@ function createOAuthAuthorizeMethod(options) {
         return result;
       }
     };
-    const isHeadless = options.isHeadless?.() ?? !!(process.env.SSH_CONNECTION || process.env.SSH_CLIENT || process.env.SSH_TTY || process.env.OPENCODE_HEADLESS);
-    let authorization;
-    let settled = false;
-    let exchangeInFlight = false;
-    let finalResult;
-    const handleCallbackUrl = async (callbackUrl2) => {
-      if (settled) {
-        return {
-          ok: finalResult?.type === "success",
-          terminal: false,
-          status: finalResult?.type === "success" ? 200 : 400,
-          message: finalResult?.type === "failed" ? finalResult.error : "OAuth sign-in has already completed."
-        };
-      }
-      const state = callbackUrl2.searchParams.get("state");
-      if (!state || !authorization) {
-        return {
-          ok: false,
-          terminal: false,
-          status: 400,
-          message: "Missing OAuth state."
-        };
-      }
-      if (state !== authorization.state) {
-        if (isGeminiDebugEnabled()) {
-          logGeminiDebugMessage("Ignoring OAuth callback with mismatched state");
-        }
-        return {
-          ok: false,
-          terminal: false,
-          status: 400,
-          message: "Invalid OAuth state parameter. Return to the sign-in flow and try again."
-        };
-      }
-      const callbackError = callbackUrl2.searchParams.get("error");
-      if (callbackError) {
-        const errorMessage = callbackUrl2.searchParams.get("error_description") || callbackError;
-        settled = true;
-        finalResult = { type: "failed", error: errorMessage };
-        return { ok: false, terminal: true, status: 400, message: errorMessage };
-      }
-      const code = callbackUrl2.searchParams.get("code");
-      if (!code) {
-        return {
-          ok: false,
-          terminal: false,
-          status: 400,
-          message: "Missing authorization code."
-        };
-      }
-      if (exchangeInFlight) {
-        return {
-          ok: false,
-          terminal: false,
-          status: 409,
-          message: "OAuth callback exchange is already in progress."
-        };
-      }
-      exchangeInFlight = true;
-      try {
-        const exchangeResult = await exchangeFn(code, authorization.verifier, options.redirectUri);
-        if (shouldIgnoreMalformedAuthCode(exchangeResult)) {
-          if (isGeminiDebugEnabled()) {
-            logGeminiDebugMessage(
-              "Ignoring malformed OAuth callback code and waiting for the next redirect"
-            );
-          }
-          return {
-            ok: false,
-            terminal: false,
-            status: 400,
-            message: "Malformed authorization code. Waiting for valid redirect."
-          };
-        }
-        if (exchangeResult.type === "failed") {
-          settled = true;
-          finalResult = exchangeResult;
-          return {
-            ok: false,
-            terminal: true,
-            status: 502,
-            message: exchangeResult.error
-          };
-        }
-        const hydrated = await maybeHydrateProjectId(exchangeResult);
-        settled = true;
-        finalResult = hydrated;
-        return { ok: true, terminal: true, status: 200 };
-      } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : "Unknown error";
-        settled = true;
-        finalResult = { type: "failed", error: errorMessage };
-        return { ok: false, terminal: true, status: 502, message: errorMessage };
-      } finally {
-        exchangeInFlight = false;
-      }
-    };
-    let listener = null;
-    if (!isHeadless) {
-      try {
-        const superseded = activeListener;
-        activeListener = null;
-        await superseded?.close().catch(() => {
-        });
-        listener = await startListenerFn({
-          timeoutMs: options.timeoutMs,
-          redirectUri: options.redirectUri,
-          onCallback: handleCallbackUrl
-        });
-        activeListener = listener;
-      } catch (error) {
-        const detail = error instanceof Error ? ` (${error.message})` : "";
-        console.log(
-          `Warning: Couldn't start the local callback listener${detail}. You'll need to paste the authorization code.`
-        );
-      }
-    } else {
-      console.log("Headless environment detected. You'll need to paste the authorization code.");
-    }
-    const codeRedirectUri = listener ? void 0 : options.codeRedirectUri;
-    const signIn = await authorizeFn(codeRedirectUri ?? options.redirectUri);
-    authorization = signIn;
-    if (!isHeadless) {
-      openBrowser(signIn.url);
-    }
-    if (listener) {
-      return {
-        url: signIn.url,
-        instructions: "Complete the sign-in flow in your browser. We'll automatically detect the redirect back to localhost.",
-        method: "auto",
-        callback: async () => {
-          try {
-            await listener.waitForCallback();
-            return finalResult ?? {
-              type: "failed",
-              error: "OAuth listener exited without producing credentials"
-            };
-          } catch (error) {
-            return {
-              type: "failed",
-              error: error instanceof Error ? error.message : "Unknown error"
-            };
-          } finally {
-            if (activeListener === listener) activeListener = null;
-            try {
-              await listener?.close();
-            } catch {
-            }
-          }
-        }
-      };
-    }
+    const signIn = await authorizeFn();
     return {
       url: signIn.url,
-      instructions: codeRedirectUri ? "Sign in in your browser, then paste the authorization code shown on the Google page." : `Complete OAuth in your browser, then paste the full redirected URL from the address bar (e.g., ${options.redirectUri ?? "http://localhost:<port>/callback"}?code=...&state=...).`,
-      method: "code",
-      callback: async (callbackUrl2) => {
+      instructions: "Paste the authorization code here:",
+      callback: async (pasted) => {
         try {
-          const { code, state, error, errorDescription } = parseOAuthCallbackInput(callbackUrl2);
+          const { code, state, error, errorDescription } = parseOAuthCallbackInput(pasted);
           if (error) {
             return { type: "failed", error: errorDescription || error };
           }
@@ -1342,12 +847,10 @@ function createOAuthAuthorizeMethod(options) {
           if (state && state !== signIn.state) {
             return { type: "failed", error: "State mismatch in callback input (possible CSRF attempt)" };
           }
-          if (!state && !(codeRedirectUri && signIn.verifier)) {
+          if (!state && !signIn.verifier) {
             return { type: "failed", error: "Paste the full redirected URL (it carries the state that ties it to this sign-in)" };
           }
-          return await maybeHydrateProjectId(
-            await exchangeFn(code, signIn.verifier, codeRedirectUri ?? options.redirectUri)
-          );
+          return await maybeHydrateProjectId(await exchangeFn(code, signIn.verifier));
         } catch (error) {
           return {
             type: "failed",
@@ -1388,25 +891,6 @@ function parseOAuthCallbackInput(input) {
     }
   }
   return { code: trimmed };
-}
-function openBrowserUrl(url) {
-  try {
-    const platform = process.platform;
-    const command = platform === "darwin" ? "open" : platform === "win32" ? "rundll32" : "xdg-open";
-    const args = platform === "win32" ? ["url.dll,FileProtocolHandler", url] : [url];
-    const child = spawn(command, args, {
-      stdio: "ignore",
-      detached: true
-    });
-    child.unref?.();
-  } catch {
-  }
-}
-function shouldIgnoreMalformedAuthCode(result) {
-  if (result.type !== "failed") {
-    return false;
-  }
-  return /invalid_grant/i.test(result.error) && /malformed auth code/i.test(result.error);
 }
 
 // src/project.ts
@@ -1488,20 +972,18 @@ function accessTokenExpired(auth) {
 }
 
 // src/auth.ts
-async function antigravityAuthorization(redirectUri = callbackUrl()) {
+async function antigravityAuthorization() {
   const state = randomBytes2(32).toString("hex");
   const verifier = randomBytes2(32).toString("base64url");
   const url = new URL(buildAuthUrl(state));
-  url.searchParams.set("redirect_uri", redirectUri);
+  url.searchParams.set("redirect_uri", ANTIGRAVITY_CODE_REDIRECT_URI);
   url.searchParams.set("code_challenge", createHash3("sha256").update(verifier).digest("base64url"));
   url.searchParams.set("code_challenge_method", "S256");
   return { url: url.toString(), verifier, state };
 }
 var authorizeAntigravity = createOAuthAuthorizeMethod({
-  redirectUri: callbackUrl(),
-  codeRedirectUri: ANTIGRAVITY_CODE_REDIRECT_URI,
   authorizeFn: antigravityAuthorization,
-  exchangeFn: (code, verifier, redirectUri) => exchangeCode(code, verifier, redirectUri),
+  exchangeFn: exchangeCode,
   resolveProjectContextFn: async (auth, accessToken) => {
     const projectId = await resolveProject(accessToken);
     void refreshModels(accessToken, projectId);
@@ -1548,10 +1030,10 @@ async function postTokenForm(form) {
   });
   return { status: res.status, text: await readResponseText(res, MAX_TOKEN_RESPONSE_BYTES, "Google token response") };
 }
-async function exchangeCode(code, verifier, redirectUri = callbackUrl()) {
+async function exchangeCode(code, verifier) {
   try {
     const form = tokenExchangeForm(code);
-    form.set("redirect_uri", redirectUri);
+    form.set("redirect_uri", ANTIGRAVITY_CODE_REDIRECT_URI);
     if (verifier) form.set("code_verifier", verifier);
     const res = await postTokenForm(form);
     if (res.status < 200 || res.status >= 300) {
@@ -3509,12 +2991,7 @@ async function setup(ctx) {
       method: { id: METHOD_ID, type: "oauth", label: "Google AI Pro/Ultra" },
       authorize: async () => {
         const authorization = await authorizeAntigravity();
-        return authorization.method === "auto" ? {
-          url: authorization.url,
-          instructions: authorization.instructions,
-          mode: "auto",
-          callback: authorization.callback().then(toCredential)
-        } : {
+        return {
           url: authorization.url,
           instructions: authorization.instructions,
           mode: "code",
