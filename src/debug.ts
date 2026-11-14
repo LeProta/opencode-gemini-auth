@@ -241,8 +241,9 @@ function truncateForLog(text: string): string {
 function logDebug(line: string): void {
   const filePath = resolveDebugLogFilePath();
   try {
-    mkdirSync(dirname(filePath), { recursive: true });
-    appendFileSync(filePath, `${redactString(line)}\n`, "utf8");
+    // Owner-only where the platform has modes: with content logging on, the file holds prompts and answers.
+    mkdirSync(dirname(filePath), { recursive: true, mode: 0o700 });
+    appendFileSync(filePath, `${redactString(line)}\n`, { encoding: "utf8", mode: 0o600 });
   } catch {
     // Best-effort debug logging must never abort requests.
   }

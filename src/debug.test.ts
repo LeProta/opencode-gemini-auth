@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -82,6 +82,21 @@ describe("debug", () => {
     expect(content).not.toContain("secret_body_refresh");
     expect(content).not.toContain("secret_msg_token");
     expect(content).not.toContain("secret_response_token");
+  });
+
+  // Windows has no file modes; there the log inherits the profile directory's ACL.
+  it.skipIf(process.platform === "win32")("creates the log directory and file for the owner only", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "gemini-debug-test-"));
+    tempDirs.push(tempDir);
+    process.env.OPENCODE_DATA_DIR = tempDir;
+    process.env.OPENCODE_GEMINI_DEBUG = "1";
+
+    logGeminiDebugMessage("hello");
+
+    const logDir = join(tempDir, "gemini-auth", "logs");
+    const [file] = readdirSync(logDir);
+    expect(statSync(logDir).mode & 0o777).toBe(0o700);
+    expect(statSync(join(logDir, file as string)).mode & 0o777).toBe(0o600);
   });
 
   it("keeps prompts and answers out of the log unless content logging is opted into", () => {

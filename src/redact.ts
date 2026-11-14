@@ -178,10 +178,10 @@ export function log(message: string, meta?: unknown): void {
 
   try {
     if (!ensuredDirs.has(dir)) {
-      mkdirSync(dir, { recursive: true });
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
       ensuredDirs.add(dir);
     }
-    appendFileSync(filePath, line, "utf8");
+    appendFileSync(filePath, line, { encoding: "utf8", mode: 0o600 });
   } catch {
     // Best-effort logging must never interrupt auth or request flows.
   }
