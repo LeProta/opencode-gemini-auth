@@ -290,6 +290,78 @@ describe("oauth-authorize and localhost callback server", () => {
     });
   });
 
+  it("without a listener, signs in through the provider's code page like the Antigravity CLI", async () => {
+    const hosted = "https://antigravity.google/oauth-callback";
+    for (const setup of [
+      { isHeadless: () => true },
+      {
+        isHeadless: () => false,
+        openBrowser: () => {},
+        startListenerFn: async (): Promise<OAuthListener> => {
+          throw new Error("port in use");
+        },
+      },
+    ]) {
+      const redirects: (string | undefined)[] = [];
+      const exchanges: [string, string, string | undefined][] = [];
+      const authorize = createOAuthAuthorizeMethod({
+        ...setup,
+        redirectUri: "http://localhost:51121/oauth-callback",
+        codeRedirectUri: hosted,
+        authorizeFn: async (redirectUri) => {
+          redirects.push(redirectUri);
+          return sampleAuth;
+        },
+        exchangeFn: async (code, verifier, redirectUri) => {
+          exchanges.push([code, verifier, redirectUri]);
+          return { type: "success", refresh: "r", access: "a", expires: Date.now() + 3600_000 };
+        },
+      });
+      const method = await authorize();
+      if (method.method !== "code") throw new Error("Expected code OAuth method");
+      expect(redirects).toEqual([hosted]);
+      expect(method.instructions).toContain("paste the authorization code");
+
+      // A URL that carries a state is still checked; a non-token paste never reaches Google.
+      expect((await method.callback(`${hosted}?code=c1&state=bad`)).type).toBe("failed");
+      expect((await method.callback("4/0Aéb")).type).toBe("failed");
+      expect(exchanges).toEqual([]);
+
+      // Google's page shows the bare code: PKCE ties it to this sign-in, and the exchange
+      // repeats the redirect URI of the authorization request (RFC 6749 §4.1.3).
+      expect((await method.callback("  4/0Ab-code  ")).type).toBe("success");
+      expect(exchanges).toEqual([["4/0Ab-code", "pkce-verifier", hosted]]);
+    }
+  });
+
+  it("keeps the local redirect when the listener runs", async () => {
+    const harness = createInProcessListenerHarness();
+    const redirects: (string | undefined)[] = [];
+    const exchanges: (string | undefined)[] = [];
+    const authorize = createOAuthAuthorizeMethod({
+      isHeadless: () => false,
+      openBrowser: () => {},
+      redirectUri: "http://localhost:51121/oauth-callback",
+      codeRedirectUri: "https://antigravity.google/oauth-callback",
+      authorizeFn: async (redirectUri) => {
+        redirects.push(redirectUri);
+        return sampleAuth;
+      },
+      exchangeFn: async (_code, _verifier, redirectUri) => {
+        exchanges.push(redirectUri);
+        return { type: "success", refresh: "r", access: "a", expires: Date.now() + 3600_000 };
+      },
+      startListenerFn: harness.startListenerFn,
+    });
+    const method = await authorize();
+    if (method.method !== "auto") throw new Error("Expected auto OAuth method");
+    const result = method.callback();
+    await harness.dispatchRequest("/oauth2callback?code=good-code&state=expected-state");
+    expect((await result).type).toBe("success");
+    expect(redirects).toEqual(["http://localhost:51121/oauth-callback"]);
+    expect(exchanges).toEqual(["http://localhost:51121/oauth-callback"]);
+  });
+
   it("frees the callback port of an abandoned sign-in when a new one starts", async () => {
     const authorize = createOAuthAuthorizeMethod({
       redirectUri: "http://localhost:51197/oauth-callback",

@@ -78,6 +78,19 @@ describe("Google sign-in PKCE (RFC 7636)", () => {
     expect(form.get("code_verifier")).toBe("verifier-123");
     expect(form.get("code")).toBe("auth-code");
     expect(form.get("grant_type")).toBe("authorization_code");
+    expect(form.get("redirect_uri")).toBe("http://localhost:51121/oauth-callback");
+  });
+
+  it("uses Google's code page as redirect in both requests of a pasted-code sign-in", async () => {
+    const hosted = "https://antigravity.google/oauth-callback";
+    const signIn = await antigravityAuthorization(hosted);
+    const url = new URL(signIn.url);
+    expect(url.searchParams.get("redirect_uri")).toBe(hosted);
+    expect(url.searchParams.getAll("redirect_uri").length).toBe(1);
+    expect(url.searchParams.get("code_challenge_method")).toBe("S256");
+    const calls = tokenEndpoint(200, '{"access_token":"a","expires_in":3600,"refresh_token":"r"}');
+    await exchangeCode("auth-code", signIn.verifier, hosted);
+    expect(new URLSearchParams(String(calls[0]?.body)).get("redirect_uri")).toBe(hosted);
   });
 });
 

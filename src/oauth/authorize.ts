@@ -16,12 +16,18 @@ export interface OAuthAuthorization {
 }
 
 export interface OAuthAuthorizeMethodOptions {
-  authorizeFn: () => Promise<OAuthAuthorization>;
-  exchangeFn: (code: string, verifier: string) => Promise<TokenExchangeResult>;
+  /** `redirectUri` is the one this sign-in will use; undefined means the client's default. */
+  authorizeFn: (redirectUri?: string) => Promise<OAuthAuthorization>;
+  exchangeFn: (code: string, verifier: string, redirectUri?: string) => Promise<TokenExchangeResult>;
   /** Runs once tokens are in hand (e.g. registration); may rewrite the stored refresh string. */
   resolveProjectContextFn?: (auth: OAuthAuthDetails, accessToken: string) => Promise<{ auth: OAuthAuthDetails }>;
   timeoutMs?: number;
   redirectUri?: string;
+  /**
+   * Provider page that shows the code to paste, used instead of `redirectUri` when no local
+   * listener runs. The page shows the code without the state, so PKCE ties it to this sign-in.
+   */
+  codeRedirectUri?: string;
   isHeadless?: () => boolean;
   openBrowser?: (url: string) => void;
   startListenerFn?: typeof startOAuthListener;
@@ -82,8 +88,8 @@ export function createOAuthAuthorizeMethod(options: OAuthAuthorizeMethodOptions)
         process.env.OPENCODE_HEADLESS
       );
 
-    const authorization = await authorizeFn();
-
+    // Set once the listener question is settled: the redirect URI depends on it.
+    let authorization: OAuthAuthorization | undefined;
     let settled = false;
     let exchangeInFlight = false;
     let finalResult: TokenExchangeResult | undefined;
@@ -104,7 +110,7 @@ export function createOAuthAuthorizeMethod(options: OAuthAuthorizeMethodOptions)
       // Any page can hit the local listener: only a redirect carrying this sign-in's
       // state may end it, error redirects included (RFC 6749 §4.1.2.1 echoes the state).
       const state = callbackUrl.searchParams.get("state");
-      if (!state) {
+      if (!state || !authorization) {
         return {
           ok: false,
           terminal: false,
@@ -154,7 +160,7 @@ export function createOAuthAuthorizeMethod(options: OAuthAuthorizeMethodOptions)
 
       exchangeInFlight = true;
       try {
-        const exchangeResult = await exchangeFn(code, authorization.verifier);
+        const exchangeResult = await exchangeFn(code, authorization.verifier, options.redirectUri);
         if (shouldIgnoreMalformedAuthCode(exchangeResult)) {
           if (isGeminiDebugEnabled()) {
             logGeminiDebugMessage(
@@ -209,22 +215,24 @@ export function createOAuthAuthorizeMethod(options: OAuthAuthorizeMethodOptions)
       } catch (error) {
         const detail = error instanceof Error ? ` (${error.message})` : "";
         console.log(
-          `Warning: Couldn't start the local callback listener${detail}. You'll need to paste the callback URL or authorization code.`,
+          `Warning: Couldn't start the local callback listener${detail}. You'll need to paste the authorization code.`,
         );
       }
     } else {
-      console.log(
-        "Headless environment detected. You'll need to paste the callback URL or authorization code.",
-      );
+      console.log("Headless environment detected. You'll need to paste the authorization code.");
     }
 
+    const codeRedirectUri = listener ? undefined : options.codeRedirectUri;
+    const signIn = await authorizeFn(codeRedirectUri ?? options.redirectUri);
+    authorization = signIn;
+
     if (!isHeadless) {
-      openBrowser(authorization.url);
+      openBrowser(signIn.url);
     }
 
     if (listener) {
       return {
-        url: authorization.url,
+        url: signIn.url,
         instructions:
           "Complete the sign-in flow in your browser. We'll automatically detect the redirect back to localhost.",
         method: "auto",
@@ -253,9 +261,10 @@ export function createOAuthAuthorizeMethod(options: OAuthAuthorizeMethodOptions)
     }
 
     return {
-      url: authorization.url,
-      instructions:
-        `Complete OAuth in your browser, then paste the full redirected URL from the address bar (e.g., ${options.redirectUri ?? "http://localhost:<port>/callback"}?code=...&state=...).`,
+      url: signIn.url,
+      instructions: codeRedirectUri
+        ? "Sign in in your browser, then paste the authorization code shown on the Google page."
+        : `Complete OAuth in your browser, then paste the full redirected URL from the address bar (e.g., ${options.redirectUri ?? "http://localhost:<port>/callback"}?code=...&state=...).`,
       method: "code",
       callback: async (callbackUrl: string): Promise<TokenExchangeResult> => {
         try {
@@ -266,15 +275,19 @@ export function createOAuthAuthorizeMethod(options: OAuthAuthorizeMethodOptions)
           if (!code) {
             return { type: "failed", error: "Missing authorization code in callback input" };
           }
-          // A bare code cannot be tied to this sign-in, so the state is required.
-          if (!state) {
-            return { type: "failed", error: "Paste the full redirected URL (it carries the state that ties it to this sign-in)" };
+          // RFC 6749 Appendix A: a code is 1*VSCHAR; anything else was not copied from Google.
+          if (!/^[\x20-\x7e]{1,4096}$/.test(code)) {
+            return { type: "failed", error: "The pasted text is not an authorization code" };
           }
-          if (state !== authorization.state) {
+          if (state && state !== signIn.state) {
             return { type: "failed", error: "State mismatch in callback input (possible CSRF attempt)" };
           }
+          // Without the state, only PKCE ties a code to this sign-in: Google's page shows none.
+          if (!state && !(codeRedirectUri && signIn.verifier)) {
+            return { type: "failed", error: "Paste the full redirected URL (it carries the state that ties it to this sign-in)" };
+          }
           return await maybeHydrateProjectId(
-            await exchangeFn(code, authorization.verifier),
+            await exchangeFn(code, signIn.verifier, codeRedirectUri ?? options.redirectUri),
           );
         } catch (error) {
           return {
