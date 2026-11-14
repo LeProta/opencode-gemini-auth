@@ -10,9 +10,13 @@ Requests go through the Antigravity (Cloud Code) surface the Antigravity app use
 they draw on the subscription quota, not on API credit.
 
 > [!WARNING]
-> This uses the Antigravity app's public OAuth client outside the official app. Google
-> does not sanction it, may restrict the account, or may change the surface at any time.
-> Use at your own discretion; an API key is the low-risk option.
+> This uses the Antigravity app's public OAuth client outside the official app. Google's
+> [Antigravity terms](https://antigravity.google/terms) (section 6, read 2026-11-14) say
+> that using third-party software or tools to access the service breaks the agreement and
+> may get the Antigravity and/or Gemini CLI account suspended or terminated. Nothing in
+> this plugin, including the client version it reports, makes this use permitted or
+> protects the account, and Google may change the surface at any time. Use at your own
+> discretion; an API key is the supported, low-risk option.
 
 ## Version support
 
@@ -36,7 +40,7 @@ Version `2.1.3` fixes: classifying a 429/5xx answer over 1 MB could hold the res
 forever; a sign-in left unfinished kept the callback port for 5 minutes; reasoning was
 turned off when the request asked for it without a level or budget; two cache writes
 made together lost one; a response arriving after a plugin reload stayed wrapped; the
-first request of the day waited for Google's version manifest.
+first request of the day waited for Google's version manifest. The sign-in now uses PKCE.
 
 ## Install
 
@@ -59,6 +63,11 @@ or **Google → Google AI Pro/Ultra** in `/connect`. The browser callback listen
 `localhost:51121` (fixed by Google for this client). In a headless shell, paste the
 **full** redirected URL from the address bar: it carries the `state` that ties it to
 this sign-in, so a bare code is refused.
+
+The authorization code is bound to the sign-in with PKCE (S256), as Google's
+[desktop-app OAuth guide](https://developers.google.com/identity/protocols/oauth2/native-app)
+asks: the client secret is public and `localhost` also resolves to `::1`, where another
+local process could listen, so a code alone must not be enough to get tokens.
 
 ## What it does while this login is Google's active connection
 
