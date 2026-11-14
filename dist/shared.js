@@ -357,6 +357,7 @@ var HUB_CHANGELISTS = {
   "2.24.0": "1000335682",
   "2.29.0": "1013060670"
 };
+var TOKEN_USER_AGENT = "Go-http-client/2.0";
 function userAgents(version) {
   const cl = HUB_CHANGELISTS[version];
   const short = `antigravity/hub/${version} (aidev_client; ${HUB_PLATFORM}${cl ? `; cl=${cl}` : ""})`;
@@ -364,9 +365,7 @@ function userAgents(version) {
     /** generate / stream / loadCodeAssist / fetchAvailableModels / quota */
     short,
     /** onboardUser */
-    long: `${short} ${NODE_API_CLIENT_UA}`,
-    /** OAuth token exchange and refresh */
-    refresh: "Go-http-client/2.0"
+    long: `${short} ${NODE_API_CLIENT_UA}`
   };
 }
 function onboardBody(tierId, version) {
@@ -774,9 +773,9 @@ function truncateForLog(text) {
 function logDebug(line) {
   const filePath = resolveDebugLogFilePath();
   try {
-    mkdirSync2(dirname2(filePath), { recursive: true });
+    mkdirSync2(dirname2(filePath), { recursive: true, mode: 448 });
     appendFileSync2(filePath, `${redactString(line)}
-`, "utf8");
+`, { encoding: "utf8", mode: 384 });
   } catch {
   }
 }
@@ -1508,7 +1507,7 @@ var authorizeAntigravity = createOAuthAuthorizeMethod({
 var TOKEN_TIMEOUT_MS = 15e3;
 var MAX_TOKEN_RESPONSE_BYTES = 64 * 1024;
 var MAX_TOKEN_LENGTH = 8 * 1024;
-var isBoundedToken = (value) => typeof value === "string" && value.length > 0 && value.length <= MAX_TOKEN_LENGTH;
+var isBoundedToken = (value) => typeof value === "string" && value.length <= MAX_TOKEN_LENGTH && /^[\x20-\x7e]+$/.test(value);
 function parseTokenResponse(text, now = Date.now()) {
   let value;
   try {
@@ -1519,8 +1518,12 @@ function parseTokenResponse(text, now = Date.now()) {
   if (!value || typeof value !== "object" || !isBoundedToken(value.access_token)) return void 0;
   const expiresIn = value.expires_in === void 0 ? 3600 : value.expires_in;
   if (typeof expiresIn !== "number" || !Number.isSafeInteger(expiresIn) || expiresIn <= 0) return void 0;
-  if (value.refresh_token !== void 0 && !isBoundedToken(value.refresh_token)) return void 0;
-  return { access: value.access_token, expires: now + expiresIn * 1e3, refresh: value.refresh_token };
+  if (value.refresh_token !== void 0 && (!isBoundedToken(value.refresh_token) || value.refresh_token.includes("|"))) {
+    return void 0;
+  }
+  const expires = now + expiresIn * 1e3;
+  if (!Number.isSafeInteger(expires)) return void 0;
+  return { access: value.access_token, expires, refresh: value.refresh_token };
 }
 function oauthErrorCode(text) {
   try {
@@ -1531,10 +1534,9 @@ function oauthErrorCode(text) {
   return "unknown_error";
 }
 async function postTokenForm(form) {
-  const ua = userAgents(await currentVersion());
   const res = await geminiFetch(OAUTH.tokenEndpoint, {
     method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": ua.refresh },
+    headers: { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": TOKEN_USER_AGENT },
     body: form.toString(),
     redirect: "error",
     signal: AbortSignal.timeout(TOKEN_TIMEOUT_MS)
@@ -1543,7 +1545,6 @@ async function postTokenForm(form) {
 }
 async function exchangeCode(code, verifier) {
   try {
-    const ua = userAgents(await currentVersion());
     const form = tokenExchangeForm(code);
     if (verifier) form.set("code_verifier", verifier);
     const res = await postTokenForm(form);
@@ -1555,7 +1556,8 @@ async function exchangeCode(code, verifier) {
     if (!tokens.refresh) return { type: "failed", error: "Missing refresh token in response" };
     let email;
     try {
-      const info = await upstreamJson(OAUTH.userinfoEndpoint, { method: "GET", token: tokens.access, ua: ua.short });
+      const ua = userAgents(await currentVersion()).short;
+      const info = await upstreamJson(OAUTH.userinfoEndpoint, { method: "GET", token: tokens.access, ua });
       if (typeof info.json?.email === "string") email = info.json.email;
     } catch {
     }
@@ -1565,8 +1567,15 @@ async function exchangeCode(code, verifier) {
   }
 }
 var refreshInFlight = /* @__PURE__ */ new Map();
+var refusedRefreshTokens = /* @__PURE__ */ new Set();
+var MAX_REFUSED_REFRESH_TOKENS = 256;
+var refreshTokenKey = (token) => createHash3("sha256").update(token).digest("base64url");
+var SIGN_IN_AGAIN = "Sign in again with `opencode auth login google --method antigravity`.";
 async function refreshAuth(auth, persist) {
   const parts = parseRefreshParts(auth.refresh);
+  if (refusedRefreshTokens.has(refreshTokenKey(parts.refreshToken))) {
+    throw new Error(`Google refresh token rejected (invalid_grant); it will not be sent again. ${SIGN_IN_AGAIN}`);
+  }
   let run = refreshInFlight.get(parts.refreshToken);
   if (!run) {
     run = requestRefresh(parts.refreshToken).finally(() => refreshInFlight.delete(parts.refreshToken));
@@ -1590,9 +1599,12 @@ async function requestRefresh(refreshToken) {
     throw new Error(`Google token refresh failed: ${error instanceof Error ? error.message : String(error)}`);
   }
   if (res.status === 400 || res.status === 401) {
-    throw new Error(
-      `Google refresh token rejected (${oauthErrorCode(res.text)}). Sign in again with \`opencode auth login google --method antigravity\`.`
-    );
+    const code = oauthErrorCode(res.text);
+    if (res.status === 400 && code === "invalid_grant") {
+      if (refusedRefreshTokens.size >= MAX_REFUSED_REFRESH_TOKENS) refusedRefreshTokens.clear();
+      refusedRefreshTokens.add(refreshTokenKey(refreshToken));
+    }
+    throw new Error(`Google refresh token rejected (${code}). ${SIGN_IN_AGAIN}`);
   }
   if (res.status < 200 || res.status >= 300) {
     throw new Error(`Google token refresh failed (${res.status} ${oauthErrorCode(res.text)})`);
