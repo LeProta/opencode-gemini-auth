@@ -21,6 +21,9 @@ const HUB_CHANGELISTS: Record<string, string> = {
   "2.29.0": "1013060670",
 };
 
+/** OAuth token exchange and refresh: the same for every client version. */
+export const TOKEN_USER_AGENT = "Go-http-client/2.0";
+
 export function userAgents(version: string) {
   const cl = HUB_CHANGELISTS[version];
   const short = `antigravity/hub/${version} (aidev_client; ${HUB_PLATFORM}${cl ? `; cl=${cl}` : ""})`;
@@ -29,8 +32,6 @@ export function userAgents(version: string) {
     short,
     /** onboardUser */
     long: `${short} ${NODE_API_CLIENT_UA}`,
-    /** OAuth token exchange and refresh */
-    refresh: "Go-http-client/2.0",
   };
 }
 

@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it } from "bun:test";
 
 import { antigravityAuthorization, exchangeCode, parseTokenResponse, refreshAuth } from "./auth";
+import { resetVersionForTests } from "./config";
 
 const realFetch = globalThis.fetch;
 afterEach(() => {
@@ -38,6 +39,19 @@ describe("parseTokenResponse", () => {
     expect(parseTokenResponse('{"access_token":"a","expires_in":"3600"}')).toBeUndefined();
     expect(parseTokenResponse('{"access_token":"a","refresh_token":42}')).toBeUndefined();
     expect(parseTokenResponse("<html>")).toBeUndefined();
+  });
+
+  it("rejects values that are not tokens or would corrupt the stored credential", () => {
+    const token = (fields: object) => parseTokenResponse(JSON.stringify({ access_token: "a", expires_in: 3600, ...fields }), 1000);
+    expect(token({})?.expires).toBe(3_601_000);
+    // RFC 6749 Appendix A: VSCHAR only. U+FFFD is what a mis-decoded byte becomes.
+    expect(token({ access_token: "ya29.a\ufffdb" })).toBeUndefined();
+    expect(token({ access_token: "ya29.a\r\nX-Injected: 1" })).toBeUndefined();
+    expect(token({ refresh_token: "1//r\u00e9" })).toBeUndefined();
+    // "|" would be read back as the project separator: the token would be stored truncated.
+    expect(token({ refresh_token: "1//abc|other-project" })).toBeUndefined();
+    // An expiry the clock can never reach would leave the access token unrefreshed.
+    expect(token({ expires_in: Number.MAX_SAFE_INTEGER })).toBeUndefined();
   });
 });
 
@@ -100,6 +114,56 @@ describe("refreshAuth", () => {
     expect(message).toContain("invalid_grant");
     expect(message).toContain("opencode auth login google --method antigravity");
     expect(message).not.toContain("secret-ish");
+  });
+
+  it("never sends again a refresh token Google refused as invalid_grant", async () => {
+    const refused = { ...auth, refresh: "rt-revoked|proj-1" };
+    const calls = tokenEndpoint(400, '{"error":"invalid_grant","error_description":"Token has been expired or revoked."}');
+    await expect(refreshAuth(refused, async () => {})).rejects.toThrow("invalid_grant");
+    await expect(refreshAuth(refused, async () => {})).rejects.toThrow("will not be sent again");
+    // Same token under another project id, and a working endpoint: still not sent.
+    const later = tokenEndpoint(200, '{"access_token":"fresh","expires_in":3600}');
+    await expect(refreshAuth({ ...auth, refresh: "rt-revoked" }, async () => {})).rejects.toThrow("opencode auth login google");
+    expect(calls.length + later.length).toBe(1);
+    // A new sign-in has another token.
+    expect((await refreshAuth({ ...auth, refresh: "rt-after-sign-in" }, async () => {})).access).toBe("fresh");
+  });
+
+  it("does not wait for the version manifest: the token request is the same for every version", async () => {
+    resetVersionForTests();
+    const tokenUserAgents: (string | null)[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).includes("oauth2.googleapis.com/token")) {
+        tokenUserAgents.push(new Headers(init?.headers).get("user-agent"));
+        return new Response('{"access_token":"quick","expires_in":3600}');
+      }
+      return new Promise<Response>(() => {}); // the manifest never answers
+    }) as typeof fetch;
+    const next = await refreshAuth({ ...auth, refresh: "rt-no-manifest" }, async () => {});
+    expect(next.access).toBe("quick");
+    expect(tokenUserAgents).toEqual(["Go-http-client/2.0"]);
+  });
+
+  it("keeps retrying after failures that are not a definitive refusal", async () => {
+    const flaky = { ...auth, refresh: "rt-flaky" };
+    for (const [status, body] of [
+      [500, '{"error":"internal_failure"}'],
+      [400, '{"error":"invalid_request"}'],
+      [401, '{"error":"invalid_client"}'],
+      [401, '{"error":"invalid_grant"}'],
+      [400, "not json"],
+    ] as const) {
+      tokenEndpoint(status, body);
+      await expect(refreshAuth(flaky, async () => {})).rejects.toThrow("Google");
+    }
+    globalThis.fetch = (async () => {
+      throw new TypeError("network down");
+    }) as unknown as typeof fetch;
+    await expect(refreshAuth(flaky, async () => {})).rejects.toThrow("network down");
+
+    const calls = tokenEndpoint(200, '{"access_token":"recovered","expires_in":3600}');
+    expect((await refreshAuth(flaky, async () => {})).access).toBe("recovered");
+    expect(calls.length).toBe(1);
   });
 });
 
