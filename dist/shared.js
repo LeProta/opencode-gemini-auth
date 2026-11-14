@@ -476,6 +476,11 @@ async function fetchLiveVersion(now) {
   }
 }
 
+// src/constants.ts
+var GEMINI_CODE_ASSIST_ENDPOINT = "https://cloudcode-pa.googleapis.com";
+var GEMINI_REDIRECT_URI = "http://localhost:51121/oauth-callback";
+var ANTIGRAVITY_CODE_REDIRECT_URI = "https://antigravity.google/oauth-callback";
+
 // src/models.ts
 var EFFORT_ORDER = ["high", "medium", "low"];
 function upstreamModelFor(id, available, level) {
@@ -801,12 +806,6 @@ function resolveDebugLogFilePath() {
 
 // src/oauth/server.ts
 import { createServer } from "http";
-
-// src/constants.ts
-var GEMINI_CODE_ASSIST_ENDPOINT = "https://cloudcode-pa.googleapis.com";
-var GEMINI_REDIRECT_URI = "http://localhost:51121/oauth-callback";
-
-// src/oauth/server.ts
 var defaultRedirectUri = new URL(GEMINI_REDIRECT_URI);
 function escapeHtml(value) {
   return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
@@ -1173,7 +1172,7 @@ function createOAuthAuthorizeMethod(options) {
       }
     };
     const isHeadless = options.isHeadless?.() ?? !!(process.env.SSH_CONNECTION || process.env.SSH_CLIENT || process.env.SSH_TTY || process.env.OPENCODE_HEADLESS);
-    const authorization = await authorizeFn();
+    let authorization;
     let settled = false;
     let exchangeInFlight = false;
     let finalResult;
@@ -1187,7 +1186,7 @@ function createOAuthAuthorizeMethod(options) {
         };
       }
       const state = callbackUrl2.searchParams.get("state");
-      if (!state) {
+      if (!state || !authorization) {
         return {
           ok: false,
           terminal: false,
@@ -1232,7 +1231,7 @@ function createOAuthAuthorizeMethod(options) {
       }
       exchangeInFlight = true;
       try {
-        const exchangeResult = await exchangeFn(code, authorization.verifier);
+        const exchangeResult = await exchangeFn(code, authorization.verifier, options.redirectUri);
         if (shouldIgnoreMalformedAuthCode(exchangeResult)) {
           if (isGeminiDebugEnabled()) {
             logGeminiDebugMessage(
@@ -1285,20 +1284,21 @@ function createOAuthAuthorizeMethod(options) {
       } catch (error) {
         const detail = error instanceof Error ? ` (${error.message})` : "";
         console.log(
-          `Warning: Couldn't start the local callback listener${detail}. You'll need to paste the callback URL or authorization code.`
+          `Warning: Couldn't start the local callback listener${detail}. You'll need to paste the authorization code.`
         );
       }
     } else {
-      console.log(
-        "Headless environment detected. You'll need to paste the callback URL or authorization code."
-      );
+      console.log("Headless environment detected. You'll need to paste the authorization code.");
     }
+    const codeRedirectUri = listener ? void 0 : options.codeRedirectUri;
+    const signIn = await authorizeFn(codeRedirectUri ?? options.redirectUri);
+    authorization = signIn;
     if (!isHeadless) {
-      openBrowser(authorization.url);
+      openBrowser(signIn.url);
     }
     if (listener) {
       return {
-        url: authorization.url,
+        url: signIn.url,
         instructions: "Complete the sign-in flow in your browser. We'll automatically detect the redirect back to localhost.",
         method: "auto",
         callback: async () => {
@@ -1324,8 +1324,8 @@ function createOAuthAuthorizeMethod(options) {
       };
     }
     return {
-      url: authorization.url,
-      instructions: `Complete OAuth in your browser, then paste the full redirected URL from the address bar (e.g., ${options.redirectUri ?? "http://localhost:<port>/callback"}?code=...&state=...).`,
+      url: signIn.url,
+      instructions: codeRedirectUri ? "Sign in in your browser, then paste the authorization code shown on the Google page." : `Complete OAuth in your browser, then paste the full redirected URL from the address bar (e.g., ${options.redirectUri ?? "http://localhost:<port>/callback"}?code=...&state=...).`,
       method: "code",
       callback: async (callbackUrl2) => {
         try {
@@ -1336,14 +1336,17 @@ function createOAuthAuthorizeMethod(options) {
           if (!code) {
             return { type: "failed", error: "Missing authorization code in callback input" };
           }
-          if (!state) {
-            return { type: "failed", error: "Paste the full redirected URL (it carries the state that ties it to this sign-in)" };
+          if (!/^[\x20-\x7e]{1,4096}$/.test(code)) {
+            return { type: "failed", error: "The pasted text is not an authorization code" };
           }
-          if (state !== authorization.state) {
+          if (state && state !== signIn.state) {
             return { type: "failed", error: "State mismatch in callback input (possible CSRF attempt)" };
           }
+          if (!state && !(codeRedirectUri && signIn.verifier)) {
+            return { type: "failed", error: "Paste the full redirected URL (it carries the state that ties it to this sign-in)" };
+          }
           return await maybeHydrateProjectId(
-            await exchangeFn(code, authorization.verifier)
+            await exchangeFn(code, signIn.verifier, codeRedirectUri ?? options.redirectUri)
           );
         } catch (error) {
           return {
@@ -1485,18 +1488,20 @@ function accessTokenExpired(auth) {
 }
 
 // src/auth.ts
-async function antigravityAuthorization() {
+async function antigravityAuthorization(redirectUri = callbackUrl()) {
   const state = randomBytes2(32).toString("hex");
   const verifier = randomBytes2(32).toString("base64url");
   const url = new URL(buildAuthUrl(state));
+  url.searchParams.set("redirect_uri", redirectUri);
   url.searchParams.set("code_challenge", createHash3("sha256").update(verifier).digest("base64url"));
   url.searchParams.set("code_challenge_method", "S256");
   return { url: url.toString(), verifier, state };
 }
 var authorizeAntigravity = createOAuthAuthorizeMethod({
   redirectUri: callbackUrl(),
+  codeRedirectUri: ANTIGRAVITY_CODE_REDIRECT_URI,
   authorizeFn: antigravityAuthorization,
-  exchangeFn: (code, verifier) => exchangeCode(code, verifier),
+  exchangeFn: (code, verifier, redirectUri) => exchangeCode(code, verifier, redirectUri),
   resolveProjectContextFn: async (auth, accessToken) => {
     const projectId = await resolveProject(accessToken);
     void refreshModels(accessToken, projectId);
@@ -1543,9 +1548,10 @@ async function postTokenForm(form) {
   });
   return { status: res.status, text: await readResponseText(res, MAX_TOKEN_RESPONSE_BYTES, "Google token response") };
 }
-async function exchangeCode(code, verifier) {
+async function exchangeCode(code, verifier, redirectUri = callbackUrl()) {
   try {
     const form = tokenExchangeForm(code);
+    form.set("redirect_uri", redirectUri);
     if (verifier) form.set("code_verifier", verifier);
     const res = await postTokenForm(form);
     if (res.status < 200 || res.status >= 300) {
