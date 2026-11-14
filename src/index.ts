@@ -216,19 +216,12 @@ export async function setup(ctx: V2Context): Promise<Plugin.Cleanup> {
       method: { id: METHOD_ID, type: "oauth", label: "Google AI Pro/Ultra" },
       authorize: async () => {
         const authorization = await authorizeAntigravity();
-        return authorization.method === "auto"
-          ? {
-              url: authorization.url,
-              instructions: authorization.instructions,
-              mode: "auto",
-              callback: authorization.callback().then(toCredential),
-            }
-          : {
-              url: authorization.url,
-              instructions: authorization.instructions,
-              mode: "code",
-              callback: (code: string) => authorization.callback(code).then(toCredential),
-            };
+        return {
+          url: authorization.url,
+          instructions: authorization.instructions,
+          mode: "code",
+          callback: (code: string) => authorization.callback(code).then(toCredential),
+        };
       },
       // OpenCode calls this when the stored credential expires and persists the result.
       refresh: async (credential) => {

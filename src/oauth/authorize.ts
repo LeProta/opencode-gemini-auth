@@ -1,11 +1,4 @@
-import { spawn } from "node:child_process";
-
 import { isGeminiDebugEnabled, logGeminiDebugMessage } from "../debug";
-import {
-  startOAuthListener,
-  type OAuthCallbackResponse,
-  type OAuthListener,
-} from "./server";
 import type { OAuthAuthDetails, TokenExchangeResult } from "../types";
 
 export interface OAuthAuthorization {
@@ -16,42 +9,23 @@ export interface OAuthAuthorization {
 }
 
 export interface OAuthAuthorizeMethodOptions {
-  /** `redirectUri` is the one this sign-in will use; undefined means the client's default. */
-  authorizeFn: (redirectUri?: string) => Promise<OAuthAuthorization>;
-  exchangeFn: (code: string, verifier: string, redirectUri?: string) => Promise<TokenExchangeResult>;
+  authorizeFn: () => Promise<OAuthAuthorization>;
+  exchangeFn: (code: string, verifier: string) => Promise<TokenExchangeResult>;
   /** Runs once tokens are in hand (e.g. registration); may rewrite the stored refresh string. */
   resolveProjectContextFn?: (auth: OAuthAuthDetails, accessToken: string) => Promise<{ auth: OAuthAuthDetails }>;
-  timeoutMs?: number;
-  redirectUri?: string;
-  /**
-   * Provider page that shows the code to paste, used instead of `redirectUri` when no local
-   * listener runs. The page shows the code without the state, so PKCE ties it to this sign-in.
-   */
-  codeRedirectUri?: string;
-  isHeadless?: () => boolean;
-  openBrowser?: (url: string) => void;
-  startListenerFn?: typeof startOAuthListener;
 }
 
 /**
- * Builds the OAuth authorize callback: local callback listener when possible,
- * pasted redirect URL or code otherwise.
+ * Builds the OAuth authorize callback: OpenCode shows the provider's URL, the provider's page
+ * shows the authorization code, and the user pastes it. Same flow on a desktop and over SSH:
+ * no local listener, no browser started from here.
  */
-export function createOAuthAuthorizeMethod(options: OAuthAuthorizeMethodOptions): () => Promise<
-  {
-    url: string;
-    instructions: string;
-  } & (
-    | { method: "auto"; callback: () => Promise<TokenExchangeResult> }
-    | { method: "code"; callback: (callbackUrl: string) => Promise<TokenExchangeResult> }
-  )
-> {
+export function createOAuthAuthorizeMethod(options: OAuthAuthorizeMethodOptions): () => Promise<{
+  url: string;
+  instructions: string;
+  callback: (pasted: string) => Promise<TokenExchangeResult>;
+}> {
   const { authorizeFn, exchangeFn, resolveProjectContextFn } = options;
-  const startListenerFn = options.startListenerFn ?? startOAuthListener;
-  const openBrowser = options.openBrowser ?? openBrowserUrl;
-  // The redirect port is fixed: a sign-in left unfinished would keep it for the whole
-  // timeout and push the next attempt into the paste-the-URL flow.
-  let activeListener: OAuthListener | null = null;
 
   return async () => {
     const maybeHydrateProjectId = async (result: TokenExchangeResult): Promise<TokenExchangeResult> => {
@@ -79,216 +53,33 @@ export function createOAuthAuthorizeMethod(options: OAuthAuthorizeMethodOptions)
       }
     };
 
-    const isHeadless =
-      options.isHeadless?.() ??
-      !!(
-        process.env.SSH_CONNECTION ||
-        process.env.SSH_CLIENT ||
-        process.env.SSH_TTY ||
-        process.env.OPENCODE_HEADLESS
-      );
-
-    // Set once the listener question is settled: the redirect URI depends on it.
-    let authorization: OAuthAuthorization | undefined;
-    let settled = false;
-    let exchangeInFlight = false;
-    let finalResult: TokenExchangeResult | undefined;
-
-    const handleCallbackUrl = async (callbackUrl: URL): Promise<OAuthCallbackResponse> => {
-      if (settled) {
-        return {
-          ok: finalResult?.type === "success",
-          terminal: false,
-          status: finalResult?.type === "success" ? 200 : 400,
-          message:
-            finalResult?.type === "failed"
-              ? finalResult.error
-              : "OAuth sign-in has already completed.",
-        };
-      }
-
-      // Any page can hit the local listener: only a redirect carrying this sign-in's
-      // state may end it, error redirects included (RFC 6749 §4.1.2.1 echoes the state).
-      const state = callbackUrl.searchParams.get("state");
-      if (!state || !authorization) {
-        return {
-          ok: false,
-          terminal: false,
-          status: 400,
-          message: "Missing OAuth state.",
-        };
-      }
-
-      if (state !== authorization.state) {
-        if (isGeminiDebugEnabled()) {
-          logGeminiDebugMessage("Ignoring OAuth callback with mismatched state");
-        }
-        return {
-          ok: false,
-          terminal: false,
-          status: 400,
-          message: "Invalid OAuth state parameter. Return to the sign-in flow and try again.",
-        };
-      }
-
-      const callbackError = callbackUrl.searchParams.get("error");
-      if (callbackError) {
-        const errorMessage = callbackUrl.searchParams.get("error_description") || callbackError;
-        settled = true;
-        finalResult = { type: "failed", error: errorMessage };
-        return { ok: false, terminal: true, status: 400, message: errorMessage };
-      }
-
-      const code = callbackUrl.searchParams.get("code");
-      if (!code) {
-        return {
-          ok: false,
-          terminal: false,
-          status: 400,
-          message: "Missing authorization code.",
-        };
-      }
-
-      if (exchangeInFlight) {
-        return {
-          ok: false,
-          terminal: false,
-          status: 409,
-          message: "OAuth callback exchange is already in progress.",
-        };
-      }
-
-      exchangeInFlight = true;
-      try {
-        const exchangeResult = await exchangeFn(code, authorization.verifier, options.redirectUri);
-        if (shouldIgnoreMalformedAuthCode(exchangeResult)) {
-          if (isGeminiDebugEnabled()) {
-            logGeminiDebugMessage(
-              "Ignoring malformed OAuth callback code and waiting for the next redirect",
-            );
-          }
-          return {
-            ok: false,
-            terminal: false,
-            status: 400,
-            message: "Malformed authorization code. Waiting for valid redirect.",
-          };
-        }
-
-        if (exchangeResult.type === "failed") {
-          settled = true;
-          finalResult = exchangeResult;
-          return {
-            ok: false,
-            terminal: true,
-            status: 502,
-            message: exchangeResult.error,
-          };
-        }
-
-        const hydrated = await maybeHydrateProjectId(exchangeResult);
-        settled = true;
-        finalResult = hydrated;
-        return { ok: true, terminal: true, status: 200 };
-      } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : "Unknown error";
-        settled = true;
-        finalResult = { type: "failed", error: errorMessage };
-        return { ok: false, terminal: true, status: 502, message: errorMessage };
-      } finally {
-        exchangeInFlight = false;
-      }
-    };
-
-    let listener: OAuthListener | null = null;
-    if (!isHeadless) {
-      try {
-        const superseded = activeListener;
-        activeListener = null;
-        await superseded?.close().catch(() => {});
-        listener = await startListenerFn({
-          timeoutMs: options.timeoutMs,
-          redirectUri: options.redirectUri,
-          onCallback: handleCallbackUrl,
-        });
-        activeListener = listener;
-      } catch (error) {
-        const detail = error instanceof Error ? ` (${error.message})` : "";
-        console.log(
-          `Warning: Couldn't start the local callback listener${detail}. You'll need to paste the authorization code.`,
-        );
-      }
-    } else {
-      console.log("Headless environment detected. You'll need to paste the authorization code.");
-    }
-
-    const codeRedirectUri = listener ? undefined : options.codeRedirectUri;
-    const signIn = await authorizeFn(codeRedirectUri ?? options.redirectUri);
-    authorization = signIn;
-
-    if (!isHeadless) {
-      openBrowser(signIn.url);
-    }
-
-    if (listener) {
-      return {
-        url: signIn.url,
-        instructions:
-          "Complete the sign-in flow in your browser. We'll automatically detect the redirect back to localhost.",
-        method: "auto",
-        callback: async (): Promise<TokenExchangeResult> => {
-          try {
-            await listener.waitForCallback();
-            return (
-              finalResult ?? {
-                type: "failed",
-                error: "OAuth listener exited without producing credentials",
-              }
-            );
-          } catch (error) {
-            return {
-              type: "failed",
-              error: error instanceof Error ? error.message : "Unknown error",
-            };
-          } finally {
-            if (activeListener === listener) activeListener = null;
-            try {
-              await listener?.close();
-            } catch {}
-          }
-        },
-      };
-    }
+    // One verifier and one state per sign-in, kept with its own callback.
+    const signIn = await authorizeFn();
 
     return {
       url: signIn.url,
-      instructions: codeRedirectUri
-        ? "Sign in in your browser, then paste the authorization code shown on the Google page."
-        : `Complete OAuth in your browser, then paste the full redirected URL from the address bar (e.g., ${options.redirectUri ?? "http://localhost:<port>/callback"}?code=...&state=...).`,
-      method: "code",
-      callback: async (callbackUrl: string): Promise<TokenExchangeResult> => {
+      instructions: "Paste the authorization code here:",
+      callback: async (pasted: string): Promise<TokenExchangeResult> => {
         try {
-          const { code, state, error, errorDescription } = parseOAuthCallbackInput(callbackUrl);
+          const { code, state, error, errorDescription } = parseOAuthCallbackInput(pasted);
           if (error) {
             return { type: "failed", error: errorDescription || error };
           }
           if (!code) {
             return { type: "failed", error: "Missing authorization code in callback input" };
           }
-          // RFC 6749 Appendix A: a code is 1*VSCHAR; anything else was not copied from Google.
+          // RFC 6749 Appendix A: a code is 1*VSCHAR; anything else was not copied from the provider.
           if (!/^[\x20-\x7e]{1,4096}$/.test(code)) {
             return { type: "failed", error: "The pasted text is not an authorization code" };
           }
           if (state && state !== signIn.state) {
             return { type: "failed", error: "State mismatch in callback input (possible CSRF attempt)" };
           }
-          // Without the state, only PKCE ties a code to this sign-in: Google's page shows none.
-          if (!state && !(codeRedirectUri && signIn.verifier)) {
+          // The provider's page shows the code without the state: only PKCE ties it to this sign-in.
+          if (!state && !signIn.verifier) {
             return { type: "failed", error: "Paste the full redirected URL (it carries the state that ties it to this sign-in)" };
           }
-          return await maybeHydrateProjectId(
-            await exchangeFn(code, signIn.verifier, codeRedirectUri ?? options.redirectUri),
-          );
+          return await maybeHydrateProjectId(await exchangeFn(code, signIn.verifier));
         } catch (error) {
           return {
             type: "failed",
@@ -338,26 +129,4 @@ function parseOAuthCallbackInput(input: string): {
   }
 
   return { code: trimmed };
-}
-
-function openBrowserUrl(url: string): void {
-  try {
-    const platform = process.platform;
-    const command =
-      platform === "darwin" ? "open" : platform === "win32" ? "rundll32" : "xdg-open";
-    const args = platform === "win32" ? ["url.dll,FileProtocolHandler", url] : [url];
-    const child = spawn(command, args, {
-      stdio: "ignore",
-      detached: true,
-    });
-    child.unref?.();
-  } catch {}
-}
-
-function shouldIgnoreMalformedAuthCode(result: TokenExchangeResult): boolean {
-  if (result.type !== "failed") {
-    return false;
-  }
-
-  return /invalid_grant/i.test(result.error) && /malformed auth code/i.test(result.error);
 }

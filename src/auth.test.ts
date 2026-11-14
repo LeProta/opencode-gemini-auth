@@ -2,9 +2,10 @@ import { createHash } from "node:crypto";
 
 import { afterEach, describe, expect, it } from "bun:test";
 
-import { antigravityAuthorization, exchangeCode, parseTokenResponse, refreshAuth } from "./auth";
+import { antigravityAuthorization, authorizeAntigravity, exchangeCode, parseTokenResponse, refreshAuth } from "./auth";
 import { resetVersionForTests } from "./config";
 
+const hosted = "https://antigravity.google/oauth-callback";
 const realFetch = globalThis.fetch;
 afterEach(() => {
   globalThis.fetch = realFetch;
@@ -66,11 +67,11 @@ describe("Google sign-in PKCE (RFC 7636)", () => {
     expect(second.verifier).not.toBe(first.verifier);
     // What the Antigravity client registered is untouched.
     expect(url.searchParams.get("state")).toBe(first.state);
-    expect(url.searchParams.get("redirect_uri")).toBe("http://localhost:51121/oauth-callback");
+    expect(url.searchParams.getAll("redirect_uri")).toEqual([hosted]);
     expect(url.origin + url.pathname).toBe("https://accounts.google.com/o/oauth2/v2/auth");
   });
 
-  it("sends the verifier with the code exchange", async () => {
+  it("sends the verifier and the same redirect URI with the code exchange", async () => {
     const calls = tokenEndpoint(200, '{"access_token":"a","expires_in":3600,"refresh_token":"r"}');
     const result = await exchangeCode("auth-code", "verifier-123");
     expect(result.type).toBe("success");
@@ -78,19 +79,38 @@ describe("Google sign-in PKCE (RFC 7636)", () => {
     expect(form.get("code_verifier")).toBe("verifier-123");
     expect(form.get("code")).toBe("auth-code");
     expect(form.get("grant_type")).toBe("authorization_code");
-    expect(form.get("redirect_uri")).toBe("http://localhost:51121/oauth-callback");
+    expect(form.getAll("redirect_uri")).toEqual([hosted]);
   });
 
-  it("uses Google's code page as redirect in both requests of a pasted-code sign-in", async () => {
-    const hosted = "https://antigravity.google/oauth-callback";
-    const signIn = await antigravityAuthorization(hosted);
-    const url = new URL(signIn.url);
-    expect(url.searchParams.get("redirect_uri")).toBe(hosted);
-    expect(url.searchParams.getAll("redirect_uri").length).toBe(1);
-    expect(url.searchParams.get("code_challenge_method")).toBe("S256");
-    const calls = tokenEndpoint(200, '{"access_token":"a","expires_in":3600,"refresh_token":"r"}');
-    await exchangeCode("auth-code", signIn.verifier, hosted);
-    expect(new URLSearchParams(String(calls[0]?.body)).get("redirect_uri")).toBe(hosted);
+  it("signs in on a desktop with Google's code page, without a local listener", async () => {
+    const headlessKeys = ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY", "OPENCODE_HEADLESS"] as const;
+    const saved = headlessKeys.map((key) => process.env[key]);
+    for (const key of headlessKeys) delete process.env[key];
+    try {
+      const method = await authorizeAntigravity();
+      const url = new URL(method.url);
+      expect(method.instructions).toBe("Paste the authorization code here:");
+      expect(url.searchParams.getAll("redirect_uri")).toEqual([hosted]);
+      // Nothing answers on the port the Antigravity client registered for its loopback redirect.
+      await expect(realFetch("http://127.0.0.1:51121/oauth-callback")).rejects.toThrow();
+
+      // The bare code goes to Google with this sign-in's verifier and the same redirect URI.
+      const calls = tokenEndpoint(400, '{"error":"invalid_grant"}');
+      expect(await method.callback("4/0Ab-code")).toEqual({
+        type: "failed",
+        error: "Google rejected the authorization code (400 invalid_grant)",
+      });
+      const form = new URLSearchParams(String(calls[0]?.body));
+      expect(form.get("code")).toBe("4/0Ab-code");
+      expect(form.getAll("redirect_uri")).toEqual([hosted]);
+      expect(createHash("sha256").update(form.get("code_verifier") ?? "").digest("base64url")).toBe(
+        url.searchParams.get("code_challenge") ?? "",
+      );
+    } finally {
+      headlessKeys.forEach((key, index) => {
+        if (saved[index] !== undefined) process.env[key] = saved[index];
+      });
+    }
   });
 });
 

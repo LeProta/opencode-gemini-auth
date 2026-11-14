@@ -1,389 +1,148 @@
-import { describe, expect, it, mock } from "bun:test";
+import { describe, expect, it } from "bun:test";
 import { createOAuthAuthorizeMethod, type OAuthAuthorization } from "./authorize";
 import type { TokenExchangeResult } from "../types";
-import {
-  createOAuthCallbackRequestHandler,
-  startOAuthListener,
-  type OAuthListener,
-  type OAuthListenerOptions,
-} from "./server";
 
-interface RecordedHttpResponse {
-  statusCode: number;
-  headers: Record<string, string>;
-  body: string;
+const hosted = "https://antigravity.google/oauth-callback";
+const sampleAuth: OAuthAuthorization = {
+  url: "https://accounts.google.com/o/oauth2/v2/auth?state=expected-state",
+  verifier: "pkce-verifier",
+  state: "expected-state",
+};
+const tokens = (refresh = "r"): TokenExchangeResult => ({
+  type: "success",
+  refresh,
+  access: "a",
+  expires: Date.now() + 3600_000,
+});
+
+/** A sign-in whose exchanges are recorded as [code, verifier]. */
+function signIn(authorization: OAuthAuthorization = sampleAuth) {
+  const exchanges: [string, string][] = [];
+  const authorize = createOAuthAuthorizeMethod({
+    authorizeFn: async () => authorization,
+    exchangeFn: async (code, verifier) => {
+      exchanges.push([code, verifier]);
+      return tokens();
+    },
+  });
+  return { authorize, exchanges };
 }
 
-function createInProcessListenerHarness() {
-  let capturedOptions: OAuthListenerOptions | undefined;
-  let deliverCallbackFn!: (url: URL) => void;
-  let waiterResolve: ((url: URL) => void) | undefined;
-  let waiterReject: ((error: Error) => void) | undefined;
-  let deliveredQueue: URL[] = [];
-  let closed = false;
+describe("pasted-code sign-in", () => {
+  const headlessKeys = ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY", "OPENCODE_HEADLESS"] as const;
 
-  const harness = {
-    startListenerFn: async (opts: OAuthListenerOptions = {}): Promise<OAuthListener> => {
-      capturedOptions = opts;
-      deliverCallbackFn = (url: URL) => {
-        if (waiterResolve) {
-          const resolve = waiterResolve;
-          waiterResolve = undefined;
-          waiterReject = undefined;
-          resolve(url);
-          return;
-        }
-        deliveredQueue.push(url);
-      };
-
-      return {
-        port: 8085,
-        redirectUri: "http://127.0.0.1:8085/oauth2callback",
-        waitForCallback: () => {
-          if (deliveredQueue.length > 0) {
-            return Promise.resolve(deliveredQueue.shift() as URL);
-          }
-          return new Promise<URL>((resolve, reject) => {
-            waiterResolve = resolve;
-            waiterReject = reject;
-          });
-        },
-        close: async () => {
-          closed = true;
-          waiterReject?.(new Error("closed"));
-        },
-      };
-    },
-    async dispatchRequest(requestUrl: string): Promise<RecordedHttpResponse> {
-      const handler = createOAuthCallbackRequestHandler({
-        getOrigin: () => "http://127.0.0.1:8085",
-        callbackPath: "/oauth2callback",
-        onCallback: capturedOptions?.onCallback,
-        deliverCallback: deliverCallbackFn,
-        failPendingWaiters: (err) => waiterReject?.(err),
-      });
-
-      return await new Promise<RecordedHttpResponse>((resolve) => {
-        let statusCode = 0;
-        let headers: Record<string, string> = {};
-        handler(
-          { url: requestUrl },
-          {
-            writeHead(code: number, hdrs?: Record<string, string>) {
-              statusCode = code;
-              headers = (hdrs ?? {}) as Record<string, string>;
-              return this as never;
-            },
-            end(chunk?: unknown, cb?: () => void) {
-              const body = typeof chunk === "string" ? chunk : String(chunk ?? "");
-              cb?.();
-              resolve({ statusCode, headers, body });
-              return this as never;
-            },
-          } as never,
-        );
-      });
-    },
-    isClosed: () => closed,
-  };
-
-  return harness;
-}
-
-describe("oauth-authorize and localhost callback server", () => {
-  const sampleAuth: OAuthAuthorization = {
-    url: "https://accounts.google.com/o/oauth2/v2/auth?state=expected-state",
-    verifier: "pkce-verifier",
-    state: "expected-state",
-  };
-
-  it("binds an ephemeral localhost listener and enforces timeout cleanly", async () => {
-    const listener = await startOAuthListener({
-      redirectUri: "http://127.0.0.1:0/oauth2callback",
-      timeoutMs: 25,
-    });
+  it("is the same on a desktop and over SSH: the provider's URL, then the code to paste", async () => {
+    const saved = headlessKeys.map((key) => process.env[key]);
     try {
-      expect(listener.port).toBeGreaterThan(0);
-      expect(listener.redirectUri).toBe(`http://127.0.0.1:${listener.port}/oauth2callback`);
-      await expect(listener.waitForCallback()).rejects.toThrow("Timed out waiting for OAuth callback");
+      for (const headless of [false, true]) {
+        for (const key of headlessKeys) delete process.env[key];
+        if (headless) process.env.OPENCODE_HEADLESS = "1";
+        const { authorize, exchanges } = signIn();
+        const method = await authorize();
+        expect(method.url).toBe(sampleAuth.url);
+        expect(method.instructions).toBe("Paste the authorization code here:");
+        // Google's page shows the bare code: PKCE ties it to this sign-in.
+        expect((await method.callback("  4/0Ab-code  ")).type).toBe("success");
+        expect(exchanges).toEqual([["4/0Ab-code", "pkce-verifier"]]);
+      }
     } finally {
-      await listener.close();
+      headlessKeys.forEach((key, index) => {
+        if (saved[index] === undefined) delete process.env[key];
+        else process.env[key] = saved[index];
+      });
     }
   });
 
-  it("sends 400 on state mismatch, rejects malformed code, and returns 200 only after exchange succeeds", async () => {
-    const harness = createInProcessListenerHarness();
-    const openBrowser = mock(() => {});
-    const exchangeCalls: string[] = [];
-
-    const authorize = createOAuthAuthorizeMethod({
-      isHeadless: () => false,
-      openBrowser,
-      authorizeFn: async () => sampleAuth,
-      exchangeFn: async (code): Promise<TokenExchangeResult> => {
-        exchangeCalls.push(code);
-        if (code === "bad-code") {
-          return { type: "failed", error: "invalid_grant: malformed auth code" };
-        }
-        return {
-          type: "success",
-          refresh: "refresh-1",
-          access: "access-1",
-          expires: Date.now() + 3600_000,
-        };
-      },
-      resolveProjectContextFn: async (auth) => ({
-        auth: { ...auth, refresh: "refresh-1|resolved-proj" },
-      }),
-      startListenerFn: harness.startListenerFn,
-    });
-
+  it("checks the state whenever the pasted text carries one", async () => {
+    const { authorize, exchanges } = signIn();
     const method = await authorize();
-    expect(method.method).toBe("auto");
-    expect(openBrowser.mock.calls.length).toBe(1);
-    if (method.method !== "auto") {
-      throw new Error("Expected auto OAuth method");
-    }
+    expect(await method.callback(`${hosted}?code=c1&state=bad`)).toEqual({
+      type: "failed",
+      error: "State mismatch in callback input (possible CSRF attempt)",
+    });
+    expect((await method.callback("code=c1&state=bad")).type).toBe("failed");
+    expect(exchanges).toEqual([]);
 
-    const resultPromise = method.callback();
+    expect((await method.callback(`${hosted}?code=c1&state=expected-state`)).type).toBe("success");
+    expect(exchanges).toEqual([["c1", "pkce-verifier"]]);
+  });
 
-    const incompleteResp = await harness.dispatchRequest("/oauth2callback?code=only-code");
-    expect(incompleteResp.statusCode).toBe(400);
+  it("refuses a pasted error, an empty paste and text that is not a code, without calling Google", async () => {
+    const { authorize, exchanges } = signIn();
+    const method = await authorize();
+    expect(await method.callback(`${hosted}?error=access_denied&error_description=User+cancelled`)).toEqual({
+      type: "failed",
+      error: "User cancelled",
+    });
+    expect((await method.callback("   ")).type).toBe("failed");
+    expect((await method.callback(`${hosted}?state=expected-state`)).type).toBe("failed");
+    // RFC 6749 Appendix A: a code is 1*VSCHAR.
+    expect((await method.callback("4/0Aéb")).type).toBe("failed");
+    expect((await method.callback("4/0A\r\nb")).type).toBe("failed");
+    expect((await method.callback("x".repeat(4097))).type).toBe("failed");
+    expect(exchanges).toEqual([]);
+  });
 
-    // An error redirect without this sign-in's state must not end the sign-in.
-    for (const forged of [
-      "/oauth2callback?error=access_denied",
-      "/oauth2callback?error=access_denied&state=wrong-state",
-    ]) {
-      expect((await harness.dispatchRequest(forged)).statusCode).toBe(400);
-    }
+  it("refuses a bare code when the sign-in has no PKCE verifier to tie it to", async () => {
+    const { authorize, exchanges } = signIn({ ...sampleAuth, verifier: "" });
+    const method = await authorize();
+    expect((await method.callback("4/0Ab-code")).type).toBe("failed");
+    expect(exchanges).toEqual([]);
+    // The state still ties a full URL to the sign-in.
+    expect((await method.callback(`${hosted}?code=c1&state=expected-state`)).type).toBe("success");
+  });
 
-    const mismatchResp = await harness.dispatchRequest(
-      "/oauth2callback?code=any-code&state=wrong-state",
-    );
-    expect(mismatchResp.statusCode).toBe(400);
-    expect(mismatchResp.body).not.toContain("You're connected to OpenCode");
+  it("keeps the verifier of each sign-in with its own callback", async () => {
+    let attempt = 0;
+    const exchanges: [string, string][] = [];
+    const authorize = createOAuthAuthorizeMethod({
+      authorizeFn: async () => {
+        attempt += 1;
+        return { url: `https://example.test/${attempt}`, verifier: `verifier-${attempt}`, state: `state-${attempt}` };
+      },
+      exchangeFn: async (code, verifier) => {
+        exchanges.push([code, verifier]);
+        return tokens();
+      },
+    });
+    const first = await authorize();
+    const second = await authorize();
+    await second.callback("code-b");
+    await first.callback("code-a");
+    // The state of another sign-in is refused.
+    expect((await first.callback("code=code-b&state=state-2")).type).toBe("failed");
+    expect(exchanges).toEqual([
+      ["code-b", "verifier-2"],
+      ["code-a", "verifier-1"],
+    ]);
+  });
 
-    const malformedResp = await harness.dispatchRequest(
-      "/oauth2callback?code=bad-code&state=expected-state",
-    );
-    expect(malformedResp.statusCode).toBe(400);
-    expect(malformedResp.body).not.toContain("You're connected to OpenCode");
-
-    const okResp = await harness.dispatchRequest(
-      "/oauth2callback?code=good-code&state=expected-state",
-    );
-    expect(okResp.statusCode).toBe(200);
-    expect(okResp.body).toContain("You're connected to OpenCode");
-
-    const outcome = await resultPromise;
-    expect(outcome).toEqual({
+  it("reports a refused or failed exchange and adds the project to a successful one", async () => {
+    const outcomes: (TokenExchangeResult | Error)[] = [
+      { type: "failed", error: "Google rejected the authorization code (400 invalid_grant)" },
+      new Error("network down"),
+      tokens("refresh-1"),
+    ];
+    const authorize = createOAuthAuthorizeMethod({
+      authorizeFn: async () => sampleAuth,
+      exchangeFn: async () => {
+        const outcome = outcomes.shift();
+        if (!outcome || outcome instanceof Error) throw outcome ?? new Error("no outcome left");
+        return outcome;
+      },
+      resolveProjectContextFn: async (auth) => ({ auth: { ...auth, refresh: `${auth.refresh}|resolved-proj` } }),
+    });
+    const method = await authorize();
+    expect(await method.callback("c1")).toEqual({
+      type: "failed",
+      error: "Google rejected the authorization code (400 invalid_grant)",
+    });
+    expect(await method.callback("c1")).toEqual({ type: "failed", error: "network down" });
+    expect(await method.callback("c1")).toEqual({
       type: "success",
       refresh: "refresh-1|resolved-proj",
-      access: "access-1",
+      access: "a",
       expires: expect.any(Number),
     });
-    expect(exchangeCalls).toEqual(["bad-code", "good-code"]);
-    expect(harness.isClosed()).toBe(true);
-  });
-
-  it("ends the sign-in on an error redirect only when it carries this sign-in's state", async () => {
-    const harness = createInProcessListenerHarness();
-    const authorize = createOAuthAuthorizeMethod({
-      isHeadless: () => false,
-      openBrowser: () => {},
-      authorizeFn: async () => sampleAuth,
-      exchangeFn: async () => ({ type: "failed", error: "unused" }),
-      startListenerFn: harness.startListenerFn,
-    });
-    const method = await authorize();
-    if (method.method !== "auto") throw new Error("Expected auto OAuth method");
-    const resultPromise = method.callback();
-
-    expect((await harness.dispatchRequest("/oauth2callback?error=access_denied&state=wrong-state")).statusCode).toBe(400);
-    const denied = await harness.dispatchRequest(
-      "/oauth2callback?error=access_denied&error_description=User+cancelled&state=expected-state",
-    );
-    expect(denied.statusCode).toBe(400);
-    expect(await resultPromise).toEqual({ type: "failed", error: "User cancelled" });
-  });
-
-  it("responds with HTTP 502 error page and fails when token exchange fails", async () => {
-    const harness = createInProcessListenerHarness();
-
-    const authorize = createOAuthAuthorizeMethod({
-      isHeadless: () => false,
-      openBrowser: () => {},
-      authorizeFn: async () => sampleAuth,
-      exchangeFn: async () => ({
-        type: "failed",
-        error: "invalid_client: bad <client> configuration",
-      }),
-      startListenerFn: harness.startListenerFn,
-    });
-
-    const method = await authorize();
-    if (method.method !== "auto") {
-      throw new Error("Expected auto OAuth method");
-    }
-
-    const resultPromise = method.callback();
-    const failResp = await harness.dispatchRequest(
-      "/oauth2callback?code=good-code&state=expected-state",
-    );
-    expect(failResp.statusCode).toBe(502);
-    expect(failResp.body).toContain("Authentication failed");
-    expect(failResp.body).toContain("bad &lt;client&gt; configuration");
-    expect(failResp.body).not.toContain("You're connected to OpenCode");
-
-    const outcome = await resultPromise;
-    expect(outcome).toEqual({
-      type: "failed",
-      error: "invalid_client: bad <client> configuration",
-    });
-  });
-
-  it("supports headless manual code flow including pasted error redirect and state check", async () => {
-    const authorize = createOAuthAuthorizeMethod({
-      isHeadless: () => true,
-      authorizeFn: async () => sampleAuth,
-      exchangeFn: async (code) => ({
-        type: "success",
-        refresh: `refresh-${code}`,
-        access: "manual-access",
-        expires: Date.now() + 3600_000,
-      }),
-      resolveProjectContextFn: async (auth) => ({
-        auth,
-        effectiveProjectId: "",
-      }),
-    });
-
-    const method = await authorize();
-    expect(method.method).toBe("code");
-    if (method.method !== "code") {
-      throw new Error("Expected code OAuth method");
-    }
-
-    const denied = await method.callback(
-      "http://localhost:8085/oauth2callback?error=access_denied&error_description=User+cancelled",
-    );
-    expect(denied).toEqual({ type: "failed", error: "User cancelled" });
-
-    const badState = await method.callback(
-      "http://localhost:8085/oauth2callback?code=c1&state=bad",
-    );
-    expect(badState.type).toBe("failed");
-
-    // A bare code (no state) cannot be tied to this sign-in.
-    const bareCode = await method.callback("c1");
-    expect(bareCode.type).toBe("failed");
-
-    const success = await method.callback(
-      "http://localhost:8085/oauth2callback?code=c1&state=expected-state",
-    );
-    expect(success).toEqual({
-      type: "success",
-      refresh: "refresh-c1",
-      access: "manual-access",
-      expires: expect.any(Number),
-    });
-  });
-
-  it("without a listener, signs in through the provider's code page like the Antigravity CLI", async () => {
-    const hosted = "https://antigravity.google/oauth-callback";
-    for (const setup of [
-      { isHeadless: () => true },
-      {
-        isHeadless: () => false,
-        openBrowser: () => {},
-        startListenerFn: async (): Promise<OAuthListener> => {
-          throw new Error("port in use");
-        },
-      },
-    ]) {
-      const redirects: (string | undefined)[] = [];
-      const exchanges: [string, string, string | undefined][] = [];
-      const authorize = createOAuthAuthorizeMethod({
-        ...setup,
-        redirectUri: "http://localhost:51121/oauth-callback",
-        codeRedirectUri: hosted,
-        authorizeFn: async (redirectUri) => {
-          redirects.push(redirectUri);
-          return sampleAuth;
-        },
-        exchangeFn: async (code, verifier, redirectUri) => {
-          exchanges.push([code, verifier, redirectUri]);
-          return { type: "success", refresh: "r", access: "a", expires: Date.now() + 3600_000 };
-        },
-      });
-      const method = await authorize();
-      if (method.method !== "code") throw new Error("Expected code OAuth method");
-      expect(redirects).toEqual([hosted]);
-      expect(method.instructions).toContain("paste the authorization code");
-
-      // A URL that carries a state is still checked; a non-token paste never reaches Google.
-      expect((await method.callback(`${hosted}?code=c1&state=bad`)).type).toBe("failed");
-      expect((await method.callback("4/0Aéb")).type).toBe("failed");
-      expect(exchanges).toEqual([]);
-
-      // Google's page shows the bare code: PKCE ties it to this sign-in, and the exchange
-      // repeats the redirect URI of the authorization request (RFC 6749 §4.1.3).
-      expect((await method.callback("  4/0Ab-code  ")).type).toBe("success");
-      expect(exchanges).toEqual([["4/0Ab-code", "pkce-verifier", hosted]]);
-    }
-  });
-
-  it("keeps the local redirect when the listener runs", async () => {
-    const harness = createInProcessListenerHarness();
-    const redirects: (string | undefined)[] = [];
-    const exchanges: (string | undefined)[] = [];
-    const authorize = createOAuthAuthorizeMethod({
-      isHeadless: () => false,
-      openBrowser: () => {},
-      redirectUri: "http://localhost:51121/oauth-callback",
-      codeRedirectUri: "https://antigravity.google/oauth-callback",
-      authorizeFn: async (redirectUri) => {
-        redirects.push(redirectUri);
-        return sampleAuth;
-      },
-      exchangeFn: async (_code, _verifier, redirectUri) => {
-        exchanges.push(redirectUri);
-        return { type: "success", refresh: "r", access: "a", expires: Date.now() + 3600_000 };
-      },
-      startListenerFn: harness.startListenerFn,
-    });
-    const method = await authorize();
-    if (method.method !== "auto") throw new Error("Expected auto OAuth method");
-    const result = method.callback();
-    await harness.dispatchRequest("/oauth2callback?code=good-code&state=expected-state");
-    expect((await result).type).toBe("success");
-    expect(redirects).toEqual(["http://localhost:51121/oauth-callback"]);
-    expect(exchanges).toEqual(["http://localhost:51121/oauth-callback"]);
-  });
-
-  it("frees the callback port of an abandoned sign-in when a new one starts", async () => {
-    const authorize = createOAuthAuthorizeMethod({
-      redirectUri: "http://localhost:51197/oauth-callback",
-      isHeadless: () => false,
-      openBrowser: () => {},
-      authorizeFn: async () => sampleAuth,
-      exchangeFn: async () => ({ type: "failed", error: "unused" }),
-    });
-
-    const abandoned = await authorize();
-    if (abandoned.method !== "auto") throw new Error("Expected auto OAuth method");
-    const abandonedResult = abandoned.callback();
-
-    // The user gave up and starts again: the fixed port must be available.
-    const retried = await authorize();
-    expect(retried.method).toBe("auto");
-    expect(await abandonedResult).toEqual({ type: "failed", error: "OAuth listener closed before callback" });
-
-    if (retried.method !== "auto") throw new Error("Expected auto OAuth method");
-    const retriedResult = retried.callback();
-    const page = await fetch("http://127.0.0.1:51197/oauth-callback?error=access_denied&state=expected-state");
-    expect(page.status).toBe(400);
-    expect(await retriedResult).toEqual({ type: "failed", error: "access_denied" });
   });
 });

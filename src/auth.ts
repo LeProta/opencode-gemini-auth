@@ -9,37 +9,33 @@ import { createOAuthAuthorizeMethod } from "./oauth/authorize";
 import { resolveProject } from "./project";
 import { formatRefreshParts, parseRefreshParts } from "./refresh-parts";
 import type { OAuthAuthDetails, TokenExchangeResult } from "./types";
-import { OAUTH, buildAuthUrl, callbackUrl, tokenExchangeForm, tokenRefreshForm } from "./vendor/protocol.js";
+import { OAUTH, buildAuthUrl, tokenExchangeForm, tokenRefreshForm } from "./vendor/protocol.js";
 import { TOKEN_USER_AGENT, userAgents } from "./wire";
 
 /**
  * Authorization URL of one sign-in. The client secret is public, so the code is bound to this
  * sign-in with PKCE (RFC 7636, S256): Google documents it for desktop apps ("Always use PKCE"),
  * and a code read by another local process, or pasted from another sign-in, is useless without
- * the verifier. `redirectUri` is the local listener or the Google-hosted code page.
+ * the verifier. The redirect is Google's page that shows the code, not the vendored loopback one.
  */
-export async function antigravityAuthorization(
-  redirectUri = callbackUrl(),
-): Promise<{ url: string; verifier: string; state: string }> {
+export async function antigravityAuthorization(): Promise<{ url: string; verifier: string; state: string }> {
   const state = randomBytes(32).toString("hex");
   const verifier = randomBytes(32).toString("base64url");
   const url = new URL(buildAuthUrl(state));
-  url.searchParams.set("redirect_uri", redirectUri);
+  url.searchParams.set("redirect_uri", ANTIGRAVITY_CODE_REDIRECT_URI);
   url.searchParams.set("code_challenge", createHash("sha256").update(verifier).digest("base64url"));
   url.searchParams.set("code_challenge_method", "S256");
   return { url: url.toString(), verifier, state };
 }
 
 /**
- * Google sign-in with the Antigravity OAuth client, like the Antigravity CLI: callback on
- * localhost:51121, or the code pasted from Google's page when no listener can be used.
+ * Google sign-in with the Antigravity OAuth client: the code shown on Google's page is pasted
+ * into OpenCode (the Antigravity CLI's code mode), on a desktop as over SSH.
  * Then Code Assist registration so the project id travels with the refresh token.
  */
 export const authorizeAntigravity = createOAuthAuthorizeMethod({
-  redirectUri: callbackUrl(),
-  codeRedirectUri: ANTIGRAVITY_CODE_REDIRECT_URI,
   authorizeFn: antigravityAuthorization,
-  exchangeFn: (code, verifier, redirectUri) => exchangeCode(code, verifier, redirectUri),
+  exchangeFn: exchangeCode,
   resolveProjectContextFn: async (auth, accessToken) => {
     const projectId = await resolveProject(accessToken);
     void refreshModels(accessToken, projectId);
@@ -107,15 +103,11 @@ async function postTokenForm(form: URLSearchParams): Promise<{ status: number; t
   return { status: res.status, text: await readResponseText(res, MAX_TOKEN_RESPONSE_BYTES, "Google token response") };
 }
 
-/** Exchanges the code with the PKCE verifier and redirect URI of the sign-in that produced it. */
-export async function exchangeCode(
-  code: string,
-  verifier: string,
-  redirectUri = callbackUrl(),
-): Promise<TokenExchangeResult> {
+/** Exchanges the code with the PKCE verifier of the sign-in that produced it. */
+export async function exchangeCode(code: string, verifier: string): Promise<TokenExchangeResult> {
   try {
     const form = tokenExchangeForm(code);
-    form.set("redirect_uri", redirectUri); // RFC 6749 §4.1.3: identical to the authorization request
+    form.set("redirect_uri", ANTIGRAVITY_CODE_REDIRECT_URI); // RFC 6749 §4.1.3: identical to the authorization request
     if (verifier) form.set("code_verifier", verifier);
     const res = await postTokenForm(form);
     if (res.status < 200 || res.status >= 300) {
