@@ -36,22 +36,24 @@ the minor for compatible features, and the patch for fixes or documentation upda
 Each plugin advances independently; matching numbers do not imply matching features.
 Fork versions are independent of upstream versions and client versions sent to APIs.
 
-Version `2.2.0` fixes: classifying a 429/5xx answer over 1 MB could hold the response
-forever; a sign-in left unfinished kept the callback port for 5 minutes; reasoning was
-turned off when the request asked for it without a level or budget; two cache writes
+Version `2.3.0` changes the sign-in: Google's page shows a code that you paste into
+OpenCode, on a desktop as over SSH, as with the Claude login. The plugin no longer listens
+on `localhost:51121` and no longer opens the browser itself. Connections already stored
+keep working.
+
+It also fixes: classifying a 429/5xx answer over 1 MB could hold the response forever;
+reasoning was turned off when the request asked for it without a level or budget; two cache writes
 made together lost one; a response arriving after a plugin reload stayed wrapped; the
 first request of the day waited for Google's version manifest. The sign-in now uses PKCE.
 A refresh token Google refuses with `invalid_grant` (expired or revoked) is not sent
 again until OpenCode restarts or you sign in again; network errors and other answers
 are still retried. Token answers that are not tokens (RFC 6749 Appendix A) or carry an
 unusable expiry are refused, and a token refresh no longer waits for the version manifest.
-Without a local callback, the sign-in uses Google's code page and a pasted code, as the
-Antigravity CLI does over SSH, instead of asking for the redirected `localhost` URL.
 
 ## Install
 
 ```bash
-opencode plugin add github:LeProta/opencode-gemini-auth#v2.2.0
+opencode plugin add github:LeProta/opencode-gemini-auth#v2.3.0
 ```
 
 Pin a tag: `github:LeProta/opencode-gemini-auth` alone follows `main`. To update, change
@@ -65,18 +67,23 @@ the tag (or run `opencode plugin update`); to roll back, install the previous ta
 opencode auth login google --method antigravity
 ```
 
-or **Google → Google AI Pro/Ultra** in `/connect`. The sign-in follows the two modes of
-the Antigravity CLI. The browser callback listens on `localhost:51121` (fixed by Google
-for this client). Over SSH, with `OPENCODE_HEADLESS=1`, or when that port is taken, Google
-sends you instead to its **Google Antigravity Authentication** page
-(`https://antigravity.google/oauth-callback`), which shows a code: paste it into OpenCode,
-as with the Claude login. That page shows the code without the `state`; PKCE is what
-ties the code to this sign-in.
+or **Google → Google AI Pro/Ultra** in `/connect`. It works like the Claude Pro/Max login,
+on a desktop as over SSH:
 
-The authorization code is bound to the sign-in with PKCE (S256), as Google's
+1. OpenCode shows Google's sign-in address. Open it and sign in.
+2. Google sends you to its **Google Antigravity Authentication** page
+   (`https://antigravity.google/oauth-callback`), which shows a code.
+3. Paste that code into OpenCode.
+
+This is the code mode of the Antigravity CLI (the one it uses over SSH). The plugin starts
+no local server and does not wait for a `localhost` redirect.
+
+The page shows the code without the `state`, so the code is bound to the sign-in with PKCE
+(S256), as Google's
 [desktop-app OAuth guide](https://developers.google.com/identity/protocols/oauth2/native-app)
-asks: the client secret is public and `localhost` also resolves to `::1`, where another
-local process could listen, so a code alone must not be enough to get tokens.
+asks: the client secret is public, so a code alone must not be enough to get tokens. A code
+from another sign-in is refused by Google, and a pasted address that carries a `state` is
+checked against this sign-in before anything is sent.
 
 ## What it does while this login is Google's active connection
 
