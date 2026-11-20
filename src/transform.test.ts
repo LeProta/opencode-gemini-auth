@@ -41,9 +41,7 @@ describe("toAntigravityRequest", () => {
     expect(envelope.requestId).toMatch(/^agent-[0-9a-f-]{36}$/);
     expect(envelope.request.safetySettings).toBeUndefined();
     expect(envelope.request.session_id).toBeUndefined();
-    // CLIProxyAPI drops maxOutputTokens for every non-Claude model
-    // and the reasoning text is requested so OpenCode can show it
-    expect(envelope.request.generationConfig).toEqual({ temperature: 0.5, thinkingConfig: { includeThoughts: true, thinkingLevel: "high" } });
+    expect(envelope.request.generationConfig).toEqual({ maxOutputTokens: 1000, temperature: 0.5, thinkingConfig: { includeThoughts: true, thinkingLevel: "high" } });
     expect(envelope.request.contents[0].parts[0].text).toBe("hello");
   });
 

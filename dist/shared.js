@@ -138,9 +138,6 @@ function antigravityEnvelope(model, project, geminiRequest) {
       ...request.toolConfig,
       functionCallingConfig: { ...request.toolConfig?.functionCallingConfig, mode: "VALIDATED" }
     };
-  } else if (request.generationConfig) {
-    const { maxOutputTokens: _dropped, ...generationConfig } = request.generationConfig;
-    request.generationConfig = generationConfig;
   }
   const envelope = {
     model,
@@ -492,6 +489,10 @@ var SECRET_KEY_NAMES = /* @__PURE__ */ new Set([
   "authorization",
   "bearer",
   "clientsecret",
+  "authorizationcode",
+  "codeverifier",
+  "codechallenge",
+  "state",
   "cookie",
   "idtoken",
   "password",
@@ -550,7 +551,7 @@ function redact(value, seen = /* @__PURE__ */ new WeakSet()) {
   if (value instanceof URLSearchParams) {
     const out2 = {};
     value.forEach((v, k) => {
-      out2[k] = isSensitiveKey(k) ? REDACTED : redactString(v);
+      out2[k] = k.toLowerCase() === "code" || isSensitiveKey(k) ? REDACTED : redactString(v);
     });
     return out2;
   }
@@ -567,10 +568,10 @@ function redact(value, seen = /* @__PURE__ */ new WeakSet()) {
 }
 function redactString(input) {
   return input.replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi, `$1 ${REDACTED}`).replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, REDACTED).replace(/\bya29\.[A-Za-z0-9._-]{8,}\b/g, REDACTED).replace(/\b1\/\/[A-Za-z0-9._-]{8,}\b/g, REDACTED).replace(/\bAIza[0-9A-Za-z_-]{20,}\b/g, REDACTED).replace(/\bGOCSPX-[0-9A-Za-z_-]{10,}\b/g, REDACTED).replace(
-    /("(?:access_token|refresh_token|id_token|client_secret|authorization|x-goog-api-key|x-api-key|api_key|apiKey)"\s*:\s*")([^"]*)(")/gi,
+    /("(?:access_token|refresh_token|id_token|client_secret|authorization|x-goog-api-key|x-api-key|api_key|apiKey|code_verifier|code_challenge|state)"\s*:\s*")([^"]*)(")/gi,
     `$1${REDACTED}$3`
   ).replace(
-    /\b(access_token|refresh_token|id_token|client_secret|authorization|api_key)=([^&\s]+)/gi,
+    /\b(access_token|refresh_token|id_token|client_secret|authorization|api_key|code|code_verifier|code_challenge|state)=([^&\s]+)/gi,
     `$1=${REDACTED}`
   );
 }
@@ -773,14 +774,21 @@ function createOAuthAuthorizeMethod(options) {
       }
     };
     const signIn = await authorizeFn();
+    let submitted;
     return {
       url: signIn.url,
       instructions: "Paste the authorization code here:",
       callback: async (pasted) => {
         try {
-          const { code, state, error, errorDescription } = parseOAuthCallbackInput(pasted);
+          if (pasted.length > 16 * 1024) {
+            return { type: "failed", error: "The pasted authorization input is too long" };
+          }
+          const { code, state, error } = parseOAuthCallbackInput(pasted);
+          if (state !== void 0 && state !== signIn.state) {
+            return { type: "failed", error: "State mismatch in callback input (possible CSRF attempt)" };
+          }
           if (error) {
-            return { type: "failed", error: errorDescription || error };
+            return { type: "failed", error: "Google authorization failed or was cancelled. Start a new sign-in." };
           }
           if (!code) {
             return { type: "failed", error: "Missing authorization code in callback input" };
@@ -788,17 +796,25 @@ function createOAuthAuthorizeMethod(options) {
           if (!/^[\x20-\x7e]{1,4096}$/.test(code)) {
             return { type: "failed", error: "The pasted text is not an authorization code" };
           }
-          if (state && state !== signIn.state) {
-            return { type: "failed", error: "State mismatch in callback input (possible CSRF attempt)" };
-          }
           if (!state && !signIn.verifier) {
             return { type: "failed", error: "Paste the full redirected URL (it carries the state that ties it to this sign-in)" };
           }
-          return await maybeHydrateProjectId(await exchangeFn(code, signIn.verifier));
+          if (submitted) {
+            return code === submitted.code ? await submitted.result : { type: "failed", error: "This sign-in has already submitted a code. Start a new sign-in." };
+          }
+          const result = (async () => {
+            try {
+              return await maybeHydrateProjectId(await exchangeFn(code, signIn.verifier));
+            } catch {
+              return { type: "failed", error: "Google code exchange failed. Start a new sign-in." };
+            }
+          })();
+          submitted = { code, result };
+          return await result;
         } catch (error) {
           return {
             type: "failed",
-            error: error instanceof Error ? error.message : "Unknown error"
+            error: "Invalid authorization input"
           };
         }
       }
@@ -813,11 +829,13 @@ function parseOAuthCallbackInput(input) {
   if (/^https?:\/\//i.test(trimmed)) {
     try {
       const url = new URL(trimmed);
+      if (["code", "state", "error"].some((key) => url.searchParams.getAll(key).length > 1)) {
+        return { error: "invalid_callback" };
+      }
       return {
         code: url.searchParams.get("code") || void 0,
-        state: url.searchParams.get("state") || void 0,
-        error: url.searchParams.get("error") || void 0,
-        errorDescription: url.searchParams.get("error_description") || void 0
+        state: url.searchParams.get("state") ?? void 0,
+        error: url.searchParams.get("error") || void 0
       };
     } catch {
       return {};
@@ -826,12 +844,14 @@ function parseOAuthCallbackInput(input) {
   const candidate = trimmed.startsWith("?") ? trimmed.slice(1) : trimmed;
   if (candidate.includes("=")) {
     const params = new URLSearchParams(candidate);
+    if (["code", "state", "error"].some((key) => params.getAll(key).length > 1)) {
+      return { error: "invalid_callback" };
+    }
     const code = params.get("code") || void 0;
-    const state = params.get("state") || void 0;
+    const state = params.get("state") ?? void 0;
     const error = params.get("error") || void 0;
-    const errorDescription = params.get("error_description") || void 0;
     if (code || state || error) {
-      return { code, state, error, errorDescription };
+      return { code, state, error };
     }
   }
   return { code: trimmed };
@@ -1128,9 +1148,6 @@ function isTrustedGoogleUrl(input) {
     return false;
   }
 }
-
-// src/request/prepare.ts
-import { randomUUID as randomUUID5 } from "crypto";
 
 // src/request/model-config.ts
 var MODEL_PREFIX_RE = /^(?:google\/|models\/)+/;
@@ -1969,48 +1986,42 @@ function sanitizeRequestPayload(requestPayload, effectiveModel, requestedModel, 
   }
 }
 function transformRequestBody(body, projectId, effectiveModel, requestedModel, thinkingConfigDefaults) {
-  const fallbackId = randomUUID5();
+  let parsedBody;
   try {
-    const parsedBody = JSON.parse(body);
-    if (!isRecord(parsedBody)) {
-      return { userPromptId: fallbackId };
-    }
-    const isWrapped = typeof parsedBody.project === "string" && isRecord(parsedBody.request);
-    if (isWrapped) {
-      const requestPayload2 = { ...parsedBody.request };
-      sanitizeRequestPayload(
-        requestPayload2,
-        effectiveModel,
-        requestedModel,
-        thinkingConfigDefaults
-      );
-      const wrappedBody2 = {
-        ...parsedBody,
-        model: effectiveModel,
-        request: requestPayload2
-      };
-      const { userPromptId: userPromptId2 } = normalizeWrappedIdentifiers(wrappedBody2);
-      return { body: JSON.stringify(wrappedBody2), userPromptId: userPromptId2 };
-    }
-    const requestPayload = { ...parsedBody };
+    parsedBody = JSON.parse(body);
+  } catch {
+    throw new Error("Google request body must be a valid JSON object");
+  }
+  if (!isRecord(parsedBody)) {
+    throw new Error("Google request body must be a valid JSON object");
+  }
+  const isWrapped = typeof parsedBody.project === "string" && isRecord(parsedBody.request);
+  if (isWrapped) {
+    const requestPayload2 = { ...parsedBody.request };
     sanitizeRequestPayload(
-      requestPayload,
+      requestPayload2,
       effectiveModel,
       requestedModel,
       thinkingConfigDefaults
     );
-    const { userPromptId } = normalizeRequestPayloadIdentifiers(requestPayload);
-    const wrappedBody = {
-      project: projectId,
+    const wrappedBody2 = {
+      ...parsedBody,
       model: effectiveModel,
-      user_prompt_id: userPromptId,
-      request: requestPayload
+      request: requestPayload2
     };
-    return { body: JSON.stringify(wrappedBody), userPromptId };
-  } catch (error) {
-    console.error("Failed to transform Gemini request body:", error);
-    return { userPromptId: fallbackId };
+    const { userPromptId: userPromptId2 } = normalizeWrappedIdentifiers(wrappedBody2);
+    return { body: JSON.stringify(wrappedBody2), userPromptId: userPromptId2 };
   }
+  const requestPayload = { ...parsedBody };
+  sanitizeRequestPayload(requestPayload, effectiveModel, requestedModel, thinkingConfigDefaults);
+  const { userPromptId } = normalizeRequestPayloadIdentifiers(requestPayload);
+  const wrappedBody = {
+    project: projectId,
+    model: effectiveModel,
+    user_prompt_id: userPromptId,
+    request: requestPayload
+  };
+  return { body: JSON.stringify(wrappedBody), userPromptId };
 }
 function resolveDefaultThinkingConfig(thinkingConfigDefaults, requestedModel, effectiveModel) {
   if (!thinkingConfigDefaults?.models) {
@@ -2086,30 +2097,15 @@ function stripThoughtPartsFromHistory(requestPayload) {
       sanitizedContents.push(content);
       continue;
     }
-    let rescuedSignature;
     const keptParts = [];
     for (const part of parts) {
-      if (isRecord(part) && part.thought === true) {
-        if (!rescuedSignature) {
-          rescuedSignature = readString(part.thoughtSignature);
-        }
+      if (isRecord(part) && part.thought === true && !readString(part.thoughtSignature)) {
         continue;
       }
       keptParts.push(isRecord(part) ? { ...part } : part);
     }
     if (keptParts.length === 0 && content.role === "model") {
       continue;
-    }
-    if (rescuedSignature && content.role === "model") {
-      const hasExistingSignature = keptParts.some(
-        (part) => isRecord(part) && Boolean(readString(part.thoughtSignature))
-      );
-      if (!hasExistingSignature) {
-        const targetPart = keptParts.find((part) => isRecord(part) && isRecord(part.functionCall)) ?? keptParts.find((part) => isRecord(part));
-        if (isRecord(targetPart)) {
-          targetPart.thoughtSignature = rescuedSignature;
-        }
-      }
     }
     sanitizedContents.push({
       ...content,

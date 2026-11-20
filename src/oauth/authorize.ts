@@ -55,15 +55,22 @@ export function createOAuthAuthorizeMethod(options: OAuthAuthorizeMethodOptions)
 
     // One verifier and one state per sign-in, kept with its own callback.
     const signIn = await authorizeFn();
+    let submitted: { code: string; result: Promise<TokenExchangeResult> } | undefined;
 
     return {
       url: signIn.url,
       instructions: "Paste the authorization code here:",
       callback: async (pasted: string): Promise<TokenExchangeResult> => {
         try {
-          const { code, state, error, errorDescription } = parseOAuthCallbackInput(pasted);
+          if (pasted.length > 16 * 1024) {
+            return { type: "failed", error: "The pasted authorization input is too long" };
+          }
+          const { code, state, error } = parseOAuthCallbackInput(pasted);
+          if (state !== undefined && state !== signIn.state) {
+            return { type: "failed", error: "State mismatch in callback input (possible CSRF attempt)" };
+          }
           if (error) {
-            return { type: "failed", error: errorDescription || error };
+            return { type: "failed", error: "Google authorization failed or was cancelled. Start a new sign-in." };
           }
           if (!code) {
             return { type: "failed", error: "Missing authorization code in callback input" };
@@ -72,18 +79,29 @@ export function createOAuthAuthorizeMethod(options: OAuthAuthorizeMethodOptions)
           if (!/^[\x20-\x7e]{1,4096}$/.test(code)) {
             return { type: "failed", error: "The pasted text is not an authorization code" };
           }
-          if (state && state !== signIn.state) {
-            return { type: "failed", error: "State mismatch in callback input (possible CSRF attempt)" };
-          }
           // The provider's page shows the code without the state: only PKCE ties it to this sign-in.
           if (!state && !signIn.verifier) {
             return { type: "failed", error: "Paste the full redirected URL (it carries the state that ties it to this sign-in)" };
           }
-          return await maybeHydrateProjectId(await exchangeFn(code, signIn.verifier));
+          if (submitted) {
+            return code === submitted.code
+              ? await submitted.result
+              : { type: "failed", error: "This sign-in has already submitted a code. Start a new sign-in." };
+          }
+          // A response lost after sending may already have consumed the code.
+          const result = (async (): Promise<TokenExchangeResult> => {
+            try {
+              return await maybeHydrateProjectId(await exchangeFn(code, signIn.verifier));
+            } catch {
+              return { type: "failed", error: "Google code exchange failed. Start a new sign-in." };
+            }
+          })();
+          submitted = { code, result };
+          return await result;
         } catch (error) {
           return {
             type: "failed",
-            error: error instanceof Error ? error.message : "Unknown error",
+            error: "Invalid authorization input",
           };
         }
       },
@@ -95,7 +113,6 @@ function parseOAuthCallbackInput(input: string): {
   code?: string;
   state?: string;
   error?: string;
-  errorDescription?: string;
 } {
   const trimmed = input.trim();
   if (!trimmed) {
@@ -105,11 +122,13 @@ function parseOAuthCallbackInput(input: string): {
   if (/^https?:\/\//i.test(trimmed)) {
     try {
       const url = new URL(trimmed);
+      if (["code", "state", "error"].some((key) => url.searchParams.getAll(key).length > 1)) {
+        return { error: "invalid_callback" };
+      }
       return {
         code: url.searchParams.get("code") || undefined,
-        state: url.searchParams.get("state") || undefined,
+        state: url.searchParams.get("state") ?? undefined,
         error: url.searchParams.get("error") || undefined,
-        errorDescription: url.searchParams.get("error_description") || undefined,
       };
     } catch {
       return {};
@@ -119,12 +138,14 @@ function parseOAuthCallbackInput(input: string): {
   const candidate = trimmed.startsWith("?") ? trimmed.slice(1) : trimmed;
   if (candidate.includes("=")) {
     const params = new URLSearchParams(candidate);
+    if (["code", "state", "error"].some((key) => params.getAll(key).length > 1)) {
+      return { error: "invalid_callback" };
+    }
     const code = params.get("code") || undefined;
-    const state = params.get("state") || undefined;
+    const state = params.get("state") ?? undefined;
     const error = params.get("error") || undefined;
-    const errorDescription = params.get("error_description") || undefined;
     if (code || state || error) {
-      return { code, state, error, errorDescription };
+      return { code, state, error };
     }
   }
 

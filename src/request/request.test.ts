@@ -9,6 +9,30 @@ import {
 } from ".";
 
 describe("request helpers", () => {
+  it("refuses malformed request objects without exposing their content", () => {
+    const url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash:generateContent";
+    for (const body of ['{"private-synthetic-prompt":', 'null', '[]', '"text"']) {
+      expect(() => prepareGeminiRequest(url, { method: "POST", body }, "tok", "proj"))
+        .toThrow("Google request body must be a valid JSON object");
+    }
+  });
+
+  it("preserves multiple signed thought parts exactly for Gemini 2.5 and Gemini 3", () => {
+    const signed = [
+      { text: "reasoning-a", thought: true, thoughtSignature: "opaque-a==" },
+      { text: "reasoning-b", thought: true, thoughtSignature: "opaque-b==" },
+    ];
+    for (const model of ["gemini-2.5-pro", "gemini-3-flash"]) {
+      const body = JSON.stringify({ contents: [
+        { role: "user", parts: [{ text: "hello" }] },
+        { role: "model", parts: [...signed, { text: "unsigned", thought: true }, { text: "answer" }] },
+      ] });
+      const result = prepareGeminiRequest(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, { body }, "tok", "proj");
+      const sent = JSON.parse(String(result.init.body));
+      expect(sent.request.contents[1].parts).toEqual([...signed, { text: "answer" }]);
+    }
+  });
+
   it("detects generativelanguage URLs", () => {
     expect(
       isGenerativeLanguageRequest(
@@ -349,7 +373,7 @@ describe("request helpers", () => {
     ]);
   });
 
-  it("rescues thoughtSignature when stripping thought parts and avoids overwriting with skip fallback", () => {
+  it("keeps a signed thought on its original part when adding tool fallbacks", () => {
     const input =
       "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent";
     const result = prepareGeminiRequest(
@@ -384,10 +408,12 @@ describe("request helpers", () => {
     const parsed = JSON.parse(result.init.body as string) as Record<string, unknown>;
     const contents = (parsed.request as { contents: Array<{ parts: Array<Record<string, unknown>> }> }).contents;
     const modelParts = contents[1]!.parts;
-    expect(modelParts.length).toBe(2);
+    expect(modelParts.length).toBe(3);
+    expect(modelParts[0]).toEqual({ text: "internal", thought: true, thoughtSignature: "real-sig-999" });
     expect(modelParts[0]?.thoughtSignature).toBe("real-sig-999");
-    expect(modelParts[1]?.thoughtSignature).toBeUndefined();
-    expect((modelParts[0]?.functionCall as { id?: string }).id).toBeTruthy();
+    expect(modelParts[1]?.thoughtSignature).toBe("skip_thought_signature_validator");
+    expect(modelParts[2]?.thoughtSignature).toBeUndefined();
+    expect((modelParts[1]?.functionCall as { id?: string }).id).toBeTruthy();
   });
 
   it("applies model-aware tool IDs, thought signatures, and thinking mode filtering", () => {

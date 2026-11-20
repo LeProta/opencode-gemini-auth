@@ -14,6 +14,10 @@ const SECRET_KEY_NAMES = new Set([
   "authorization",
   "bearer",
   "clientsecret",
+  "authorizationcode",
+  "codeverifier",
+  "codechallenge",
+  "state",
   "cookie",
   "idtoken",
   "password",
@@ -88,7 +92,7 @@ export function redact(value: unknown, seen = new WeakSet<object>()): unknown {
   if (value instanceof URLSearchParams) {
     const out: Record<string, string> = {};
     value.forEach((v, k) => {
-      out[k] = isSensitiveKey(k) ? REDACTED : redactString(v);
+      out[k] = k.toLowerCase() === "code" || isSensitiveKey(k) ? REDACTED : redactString(v);
     });
     return out;
   }
@@ -117,11 +121,11 @@ export function redactString(input: string): string {
     .replace(/\bAIza[0-9A-Za-z_-]{20,}\b/g, REDACTED)
     .replace(/\bGOCSPX-[0-9A-Za-z_-]{10,}\b/g, REDACTED)
     .replace(
-      /("(?:access_token|refresh_token|id_token|client_secret|authorization|x-goog-api-key|x-api-key|api_key|apiKey)"\s*:\s*")([^"]*)(")/gi,
+      /("(?:access_token|refresh_token|id_token|client_secret|authorization|x-goog-api-key|x-api-key|api_key|apiKey|code_verifier|code_challenge|state)"\s*:\s*")([^"]*)(")/gi,
       `$1${REDACTED}$3`,
     )
     .replace(
-      /\b(access_token|refresh_token|id_token|client_secret|authorization|api_key)=([^&\s]+)/gi,
+      /\b(access_token|refresh_token|id_token|client_secret|authorization|api_key|code|code_verifier|code_challenge|state)=([^&\s]+)/gi,
       `$1=${REDACTED}`,
     );
 }

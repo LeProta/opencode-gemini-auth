@@ -12,6 +12,14 @@ describe("userAgents", () => {
 });
 
 describe("antigravityEnvelope", () => {
+  it("preserves the caller's output budget for Gemini models", () => {
+    const request = { generationConfig: { maxOutputTokens: 123, temperature: 0.2 } };
+    for (const model of ["gemini-2.5-pro", "gemini-3-flash", "gemini-3-pro-image"]) {
+      const envelope = antigravityEnvelope(model, "p", request);
+      expect((envelope.request as typeof request).generationConfig).toEqual(request.generationConfig);
+    }
+  });
+
   it("forces VALIDATED tool calling and keeps maxOutputTokens for Claude", () => {
     const env: any = antigravityEnvelope("claude-sonnet-4-5", "p", {
       contents: [{ role: "user", parts: [{ text: "x" }] }],

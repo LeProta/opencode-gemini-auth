@@ -29,6 +29,60 @@ function signIn(authorization: OAuthAuthorization = sampleAuth) {
 }
 
 describe("pasted-code sign-in", () => {
+  it("shares one code exchange, including project resolution, across repeated submissions", async () => {
+    let calls = 0;
+    let projects = 0;
+    let release: (() => void) | undefined;
+    const ready = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const method = await createOAuthAuthorizeMethod({
+      authorizeFn: async () => sampleAuth,
+      exchangeFn: async () => {
+        calls += 1;
+        await ready;
+        return tokens();
+      },
+      resolveProjectContextFn: async (auth) => {
+        projects += 1;
+        return { auth };
+      },
+    })();
+    const first = method.callback("code-a");
+    const second = method.callback("code-a");
+    release?.();
+    expect(await second).toEqual(await first);
+    expect(await method.callback("code-a")).toEqual(await first);
+    expect((await method.callback("code-b")).type).toBe("failed");
+    expect(calls).toBe(1);
+    expect(projects).toBe(1);
+  });
+
+  it("does not submit the same code again after an ambiguous network failure", async () => {
+    let calls = 0;
+    const method = await createOAuthAuthorizeMethod({
+      authorizeFn: async () => sampleAuth,
+      exchangeFn: async () => {
+        calls += 1;
+        throw new Error("connection lost");
+      },
+    })();
+    expect((await method.callback("code-a")).type).toBe("failed");
+    expect((await method.callback("code-a")).type).toBe("failed");
+    expect(calls).toBe(1);
+  });
+
+  it("rejects empty, duplicate or mismatched state before displaying a pasted OAuth error", async () => {
+    const { authorize, exchanges } = signIn();
+    const method = await authorize();
+    for (const query of ["state=", "state=bad", "state=expected-state&state=bad"]) {
+      const result = await method.callback(`${hosted}?error=access_denied&error_description=secret-data&${query}`);
+      expect(result.type).toBe("failed");
+      if (result.type === "failed") expect(result.error).not.toContain("secret-data");
+    }
+    expect(exchanges).toEqual([]);
+  });
+
   const headlessKeys = ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY", "OPENCODE_HEADLESS"] as const;
 
   it("is the same on a desktop and over SSH: the provider's URL, then the code to paste", async () => {
@@ -72,7 +126,7 @@ describe("pasted-code sign-in", () => {
     const method = await authorize();
     expect(await method.callback(`${hosted}?error=access_denied&error_description=User+cancelled`)).toEqual({
       type: "failed",
-      error: "User cancelled",
+      error: "Google authorization failed or was cancelled. Start a new sign-in.",
     });
     expect((await method.callback("   ")).type).toBe("failed");
     expect((await method.callback(`${hosted}?state=expected-state`)).type).toBe("failed");
@@ -132,13 +186,12 @@ describe("pasted-code sign-in", () => {
       },
       resolveProjectContextFn: async (auth) => ({ auth: { ...auth, refresh: `${auth.refresh}|resolved-proj` } }),
     });
-    const method = await authorize();
-    expect(await method.callback("c1")).toEqual({
+    expect(await (await authorize()).callback("c1")).toEqual({
       type: "failed",
       error: "Google rejected the authorization code (400 invalid_grant)",
     });
-    expect(await method.callback("c1")).toEqual({ type: "failed", error: "network down" });
-    expect(await method.callback("c1")).toEqual({
+    expect(await (await authorize()).callback("c1")).toEqual({ type: "failed", error: "Google code exchange failed. Start a new sign-in." });
+    expect(await (await authorize()).callback("c1")).toEqual({
       type: "success",
       refresh: "refresh-1|resolved-proj",
       access: "a",

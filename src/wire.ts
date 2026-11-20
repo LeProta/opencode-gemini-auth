@@ -87,9 +87,6 @@ export function antigravityEnvelope(
       ...request.toolConfig,
       functionCallingConfig: { ...request.toolConfig?.functionCallingConfig, mode: "VALIDATED" },
     };
-  } else if (request.generationConfig) {
-    const { maxOutputTokens: _dropped, ...generationConfig } = request.generationConfig;
-    request.generationConfig = generationConfig;
   }
 
   const envelope: Record<string, unknown> = {

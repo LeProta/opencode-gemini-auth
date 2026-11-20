@@ -1,5 +1,3 @@
-import { randomUUID } from "node:crypto";
-
 import { GEMINI_CODE_ASSIST_ENDPOINT } from "../constants";
 import { getGeminiModelCapabilities, type GeminiThinkingMode } from "./model-config";
 import { normalizeThinkingConfig } from "./helpers";
@@ -93,7 +91,7 @@ export function prepareGeminiRequest(
     headers.set("Accept", "text/event-stream");
   }
 
-  // The User-Agent is set by toAntigravityRequest (live Antigravity client version).
+  // The User-Agent is set by toAntigravityRequest from the configured client profile.
 
   return {
     request: transformedUrl,
@@ -144,32 +142,18 @@ function transformRequestBody(
   requestedModel: string,
   thinkingConfigDefaults?: ThinkingConfigDefaults,
 ): { body?: string; userPromptId: string } {
-  const fallbackId = randomUUID();
+  let parsedBody: unknown;
   try {
-    const parsedBody: unknown = JSON.parse(body);
-    if (!isRecord(parsedBody)) {
-      return { userPromptId: fallbackId };
-    }
-
-    const isWrapped = typeof parsedBody.project === "string" && isRecord(parsedBody.request);
-    if (isWrapped) {
-      const requestPayload = { ...(parsedBody.request as Record<string, unknown>) };
-      sanitizeRequestPayload(
-        requestPayload,
-        effectiveModel,
-        requestedModel,
-        thinkingConfigDefaults,
-      );
-      const wrappedBody: Record<string, unknown> = {
-        ...parsedBody,
-        model: effectiveModel,
-        request: requestPayload,
-      };
-      const { userPromptId } = normalizeWrappedIdentifiers(wrappedBody);
-      return { body: JSON.stringify(wrappedBody), userPromptId };
-    }
-
-    const requestPayload = { ...parsedBody };
+    parsedBody = JSON.parse(body);
+  } catch {
+    throw new Error("Google request body must be a valid JSON object");
+  }
+  if (!isRecord(parsedBody)) {
+    throw new Error("Google request body must be a valid JSON object");
+  }
+  const isWrapped = typeof parsedBody.project === "string" && isRecord(parsedBody.request);
+  if (isWrapped) {
+    const requestPayload = { ...(parsedBody.request as Record<string, unknown>) };
     sanitizeRequestPayload(
       requestPayload,
       effectiveModel,
@@ -177,19 +161,25 @@ function transformRequestBody(
       thinkingConfigDefaults,
     );
 
-    const { userPromptId } = normalizeRequestPayloadIdentifiers(requestPayload);
-    const wrappedBody = {
-      project: projectId,
+    const wrappedBody: Record<string, unknown> = {
+      ...parsedBody,
       model: effectiveModel,
-      user_prompt_id: userPromptId,
       request: requestPayload,
     };
-
+    const { userPromptId } = normalizeWrappedIdentifiers(wrappedBody);
     return { body: JSON.stringify(wrappedBody), userPromptId };
-  } catch (error) {
-    console.error("Failed to transform Gemini request body:", error);
-    return { userPromptId: fallbackId };
   }
+
+  const requestPayload = { ...parsedBody };
+  sanitizeRequestPayload(requestPayload, effectiveModel, requestedModel, thinkingConfigDefaults);
+  const { userPromptId } = normalizeRequestPayloadIdentifiers(requestPayload);
+  const wrappedBody = {
+    project: projectId,
+    model: effectiveModel,
+    user_prompt_id: userPromptId,
+    request: requestPayload,
+  };
+  return { body: JSON.stringify(wrappedBody), userPromptId };
 }
 
 function resolveDefaultThinkingConfig(
@@ -306,13 +296,10 @@ function stripThoughtPartsFromHistory(requestPayload: Record<string, unknown>): 
       continue;
     }
 
-    let rescuedSignature: string | undefined;
     const keptParts: unknown[] = [];
     for (const part of parts) {
-      if (isRecord(part) && part.thought === true) {
-        if (!rescuedSignature) {
-          rescuedSignature = readString(part.thoughtSignature);
-        }
+      // Signed parts must return on their original part, including signed thoughts.
+      if (isRecord(part) && part.thought === true && !readString(part.thoughtSignature)) {
         continue;
       }
       keptParts.push(isRecord(part) ? { ...part } : part);
@@ -321,20 +308,6 @@ function stripThoughtPartsFromHistory(requestPayload: Record<string, unknown>): 
     // Drop empty model turns produced by interrupted thought streaming.
     if (keptParts.length === 0 && content.role === "model") {
       continue;
-    }
-
-    if (rescuedSignature && content.role === "model") {
-      const hasExistingSignature = keptParts.some(
-        (part) => isRecord(part) && Boolean(readString(part.thoughtSignature)),
-      );
-      if (!hasExistingSignature) {
-        const targetPart =
-          keptParts.find((part) => isRecord(part) && isRecord(part.functionCall)) ??
-          keptParts.find((part) => isRecord(part));
-        if (isRecord(targetPart)) {
-          targetPart.thoughtSignature = rescuedSignature;
-        }
-      }
     }
 
     sanitizedContents.push({

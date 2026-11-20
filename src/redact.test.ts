@@ -5,6 +5,22 @@ import { join } from "node:path";
 import { closeLogger, initLogger, log, redact } from "./redact";
 
 describe("logger", () => {
+  it("masks OAuth codes, state and PKCE in diagnostic query strings and structured values", () => {
+    const query = new URLSearchParams({ code: "synthetic-code", state: "synthetic-state", code_verifier: "synthetic-verifier", code_challenge: "synthetic-challenge" });
+    const masked = JSON.stringify(redact({
+      url: `https://example.test/callback?${query}`,
+      form: query,
+      code_verifier: "synthetic-verifier",
+      code_challenge: "synthetic-challenge",
+      state: "synthetic-state",
+      status: 400,
+    }));
+    for (const value of ["synthetic-code", "synthetic-state", "synthetic-verifier", "synthetic-challenge"]) {
+      expect(masked).not.toContain(value);
+    }
+    expect(masked).toContain('"status":400');
+  });
+
   const createdDirs: string[] = [];
 
   afterEach(() => {

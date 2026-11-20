@@ -46,6 +46,12 @@ Version `2.3.1` rebuilds the headers of each model request from the Antigravity 
 profile, so headers added by OpenCode or its SDK no longer reach Google, and only reports a
 client version that is a plain `x.y.z`.
 
+Version `3.0.1` makes each sign-in exchange its code once, including concurrent
+submissions. Start a new sign-in after an exchange failure. Signed thought parts
+return to Google at their original positions, and `maxOutputTokens` is preserved.
+Malformed JSON requests are rejected locally with a content-free error. OAuth codes,
+state and PKCE fields are masked in diagnostic query strings.
+
 Version `3.0.0` supports Windows 11 only. The default data folders of macOS and Linux are
 gone, hence the major number; nothing changes on Windows. The commands below are written
 for PowerShell.
@@ -68,7 +74,7 @@ unusable expiry are refused.
 ## Install
 
 ```powershell
-opencode plugin add github:LeProta/opencode-gemini-auth#v3.0.0
+opencode plugin add github:LeProta/opencode-gemini-auth#v3.0.1
 ```
 
 Pin a tag: `github:LeProta/opencode-gemini-auth` alone follows `main`. To update, change
